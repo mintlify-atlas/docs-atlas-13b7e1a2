@@ -1,0 +1,112 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "UNC",
+  "projectDescription": "Universal Neural Compiler that transforms HuggingFace transformer models into optimized native Metal inference binaries for Apple Silicon.",
+  "theme": "aspen",
+  "primaryColor": "#FF6B35",
+  "lightColor": "#FFB800",
+  "darkColor": "#C73E1D",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/compiler-pipeline",
+              "concepts/ir-graph",
+              "concepts/output-modes"
+            ]
+          },
+          {
+            "group": "CLI Reference",
+            "pages": [
+              "cli/compile",
+              "cli/run",
+              "cli/inspect",
+              "cli/serve",
+              "cli/list-architectures"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/quantization",
+              "guides/supported-models",
+              "guides/performance-tuning",
+              "guides/benchmarking"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/compiler-passes",
+              "advanced/kernel-fusion",
+              "advanced/memory-planning",
+              "advanced/metal-backend"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Modules",
+            "pages": [
+              "api/frontend",
+              "api/ir",
+              "api/compiler",
+              "api/kernel",
+              "api/emit",
+              "api/runtime"
+            ]
+          },
+          {
+            "group": "IR Operations",
+            "pages": [
+              "api/ir/ops",
+              "api/ir/types",
+              "api/ir/graph"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Compile HuggingFace transformers to native Metal binaries",
+    "1.35x faster with 25% less GPU power than mlx-lm",
+    "Multiple quantization levels (F16, Q8_0, Q4_0)",
+    "JIT (.unc bundle) and AOT (standalone binary) modes",
+    "Hardware-agnostic IR with Metal backend (CUDA/ROCm/WASM planned)",
+    "Advanced compiler passes: fusion, quantization, memory planning",
+    "Zero Python runtime overhead - pure native execution",
+    "Support for LLaMA, Mistral, Qwen, Phi, Gemma architectures"
+  ],
+  "publicApiSurface": [
+    "unc compile --model <MODEL> --quant <QUANT> -o <OUTPUT>",
+    "unc run <UNC_FILE> --prompt <PROMPT> --max-tokens <N>",
+    "unc inspect <UNC_FILE> [--dump-ir]",
+    "unc serve <UNC_FILE> --port <PORT>",
+    "unc list-architectures",
+    "unc::frontend::huggingface::ModelLoader",
+    "unc::frontend::config::parse_config",
+    "unc::ir::graph::Graph",
+    "unc::ir::ops::Op",
+    "unc::compile::PassPipeline",
+    "unc::kernel::registry::KernelRegistry",
+    "unc::emit::metal::emit_metal",
+    "unc::runtime::generate::run_generation"
+  ]
+}
