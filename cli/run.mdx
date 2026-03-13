@@ -1,0 +1,107 @@
+---
+title: 'unc run'
+description: 'Run inference on a compiled .unc model'
+---
+
+## Overview
+
+The `unc run` command loads a compiled `.unc` bundle and executes text generation using the specified prompt.
+
+## Command Signature
+
+```bash
+unc run <UNC_FILE> [OPTIONS]
+```
+
+## Parameters
+
+<ParamField path="unc_file" type="path" required>
+  Path to the compiled `.unc` bundle file
+</ParamField>
+
+<ParamField path="prompt" type="string" default="Hello, ">
+  Input prompt to start text generation
+</ParamField>
+
+<ParamField path="max-tokens" type="integer" default="200">
+  Maximum number of tokens to generate
+</ParamField>
+
+## How It Works
+
+1. **Load Bundle** - Reads the `.unc` file containing the compiled graph, memory plan, and metadata
+2. **Locate Metallib** - Finds the Metal kernel library using this priority:
+   - Path stored in the `.unc` bundle (relative to bundle location)
+   - `UNC_METALLIB_PATH` environment variable
+   - Default: `<unc_file>.metallib` (same name, different extension)
+3. **Initialize Runtime** - Sets up Metal compute pipeline and allocates memory
+4. **Run Generation** - Executes autoregressive decoding with the specified prompt
+
+## Examples
+
+### Basic Generation
+
+```bash
+unc run llama3.unc --prompt "Hello, "
+```
+
+### Custom Prompt and Length
+
+```bash
+unc run llama3.unc \
+  --prompt "Explain quantum computing in simple terms:" \
+  --max-tokens 500
+```
+
+### Multi-line Prompts
+
+Use quotes for multi-line prompts:
+
+```bash
+unc run llama3.unc --prompt "Write a Python function that:
+1. Takes a list of numbers
+2. Returns the median value
+3. Handles edge cases"
+```
+
+### Using Different Metallib Location
+
+If your `.metallib` file is in a different location:
+
+```bash
+export UNC_METALLIB_PATH=/path/to/kernels.metallib
+unc run llama3.unc --prompt "Hello"
+```
+
+## Environment Variables
+
+<ParamField path="UNC_METALLIB_PATH" type="path">
+  Override the default Metal kernel library location. Useful when you want to use a custom or shared metallib file instead of the default `<unc_file>.metallib`
+</ParamField>
+
+## Output Format
+
+The command streams generated tokens to stdout as they're produced, allowing you to see the model's output in real-time.
+
+## Platform Requirements
+
+<Warning>
+  The `unc run` command requires macOS with Metal support. The Metal target is only available on Apple Silicon and Intel Macs with Metal-capable GPUs.
+</Warning>
+
+## Typical Workflow
+
+```bash
+# 1. Compile a model
+unc compile --model meta-llama/Llama-3.2-1B-Instruct --output llama3.unc
+
+# 2. Run inference
+unc run llama3.unc --prompt "What is Rust?" --max-tokens 300
+```
+
+## Performance Tips
+
+- **Quantization** - Models compiled with `q4-0` or `q8-0` quantization run faster
+- **Max Tokens** - Shorter generation lengths complete faster
+- **Prompt Length** - Very long prompts increase the initial processing time (prefill phase)
+- **Context Window** - Stay within the `--max-seq-len` specified during compilation

@@ -1,0 +1,159 @@
+---
+title: 'unc compile'
+description: 'Compile a HuggingFace model to a .unc bundle or standalone binary'
+---
+
+## Overview
+
+The `unc compile` command downloads a model from HuggingFace, parses its architecture, builds a computation graph, and compiles it into either:
+- A `.unc` bundle (default) for JIT execution
+- A standalone Mach-O binary (with `--binary` flag) for AOT execution
+
+## Command Signature
+
+```bash
+unc compile --model <MODEL_ID> [OPTIONS]
+```
+
+## Parameters
+
+<ParamField path="model" type="string" required>
+  HuggingFace model ID (e.g., `meta-llama/Llama-3.2-1B-Instruct`)
+</ParamField>
+
+<ParamField path="output" type="path" required>
+  Output path for the compiled artifact. Automatically appends `.unc` extension if not using `--binary`
+</ParamField>
+
+<ParamField path="quant" type="string" default="f16">
+  Quantization mode for model weights. Available options:
+  
+  - **`f32`** - Full 32-bit floating point (highest quality, largest size)
+  - **`f16`** - Half precision 16-bit floating point (default, balanced quality/size)
+  - **`bf16`** - Brain Float 16 (alternative 16-bit format, better dynamic range)
+  - **`q8-0`** - 8-bit quantization (smaller size, slight quality loss)
+  - **`q4-0`** - 4-bit quantization (smallest size, faster inference, more quality loss)
+</ParamField>
+
+<ParamField path="max-seq-len" type="integer" default="4096">
+  Maximum sequence length (context window size) for the model
+</ParamField>
+
+<ParamField path="hf-token" type="string">
+  HuggingFace access token for gated models. Can also be set via `HF_TOKEN` environment variable
+</ParamField>
+
+<ParamField path="binary" type="boolean" default="false">
+  Produce a standalone Mach-O binary instead of a `.unc` bundle. This enables AOT (Ahead-of-Time) compilation
+</ParamField>
+
+<ParamField path="unfused" type="boolean" default="false">
+  Generate unfused dispatches (MLX-style) with concurrent encoder + lazy barriers. Advanced option for debugging or specific optimization strategies
+</ParamField>
+
+## Quantization Options Explained
+
+| Format | Size | Quality | Use Case |
+|--------|------|---------|----------|
+| `f32` | 4 bytes/param | Highest | Reference/research |
+| `f16` | 2 bytes/param | Very high | Production (default) |
+| `bf16` | 2 bytes/param | Very high | Alternative to f16 |
+| `q8-0` | 1 byte/param | High | Balanced size/quality |
+| `q4-0` | 0.5 bytes/param | Good | Maximum performance |
+
+## Examples
+
+### JIT Compilation (Default)
+
+Compile a model to a `.unc` bundle:
+
+```bash
+unc compile \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --output llama3.unc
+```
+
+With custom quantization:
+
+```bash
+unc compile \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --quant q4-0 \
+  --max-seq-len 8192 \
+  --output llama3-q4.unc
+```
+
+### AOT Compilation (Standalone Binary)
+
+Compile to a standalone executable:
+
+```bash
+unc compile \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --binary \
+  --output llama3
+```
+
+### Using HuggingFace Token
+
+For gated models (e.g., Llama-2):
+
+```bash
+export HF_TOKEN=hf_xxxxxxxxxxxxx
+unc compile \
+  --model meta-llama/Llama-2-7b-chat-hf \
+  --output llama2.unc
+```
+
+Or pass the token directly:
+
+```bash
+unc compile \
+  --model meta-llama/Llama-2-7b-chat-hf \
+  --hf-token hf_xxxxxxxxxxxxx \
+  --output llama2.unc
+```
+
+## Output Artifacts
+
+### JIT Bundle (.unc)
+
+When compiling without `--binary`, you'll get:
+- `output.unc` - The bundle file containing IR, memory plan, and metadata
+- `output.metallib` - Compiled Metal kernels (referenced by the .unc file)
+
+### AOT Binary
+
+When compiling with `--binary`, you'll get:
+- A standalone Mach-O executable that can be run directly
+- No separate .metallib file needed
+
+## Compilation Process
+
+The compiler performs these steps:
+
+1. **Download** - Fetches model files from HuggingFace Hub
+2. **Parse** - Reads `config.json` to detect architecture
+3. **Lower** - Builds computation graph from architecture template
+4. **Optimize** - Runs optimization passes
+5. **Schedule** - Creates memory plan and kernel assignments
+6. **Emit** - Generates Metal code and writes output
+
+## Console Output
+
+During compilation, you'll see:
+
+```bash
+unc: compiling meta-llama/Llama-3.2-1B-Instruct → llama3.unc
+  arch=LLaMA, layers=16, heads=32 (kv=8), hidden=2048, ffn=8192
+  graph: 234 nodes, quant: f16
+  registry: 42 kernels for metal-apple8
+  compile: 234 nodes, 18 kernels, activation=512 MB, kv=256 MB
+Done → llama3.unc
+```
+
+This shows:
+- Model architecture details
+- Graph complexity (number of nodes)
+- Kernel registry size
+- Memory requirements for activations and KV cache

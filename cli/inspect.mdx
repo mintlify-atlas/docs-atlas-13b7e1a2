@@ -1,0 +1,146 @@
+---
+title: 'unc inspect'
+description: 'Inspect a .unc file (dump IR, memory plan, kernel list)'
+---
+
+## Overview
+
+The `unc inspect` command displays detailed information about a compiled `.unc` bundle, including model metadata, architecture, compilation statistics, and optionally the full intermediate representation (IR).
+
+## Command Signature
+
+```bash
+unc inspect <UNC_FILE> [OPTIONS]
+```
+
+## Parameters
+
+<ParamField path="unc_file" type="path" required>
+  Path to the compiled `.unc` bundle file to inspect
+</ParamField>
+
+<ParamField path="dump-ir" type="boolean" default="false">
+  Dump the full intermediate representation (IR) graph showing all nodes, operations, and data flow
+</ParamField>
+
+## What Information Is Displayed
+
+### Basic Info (Always Shown)
+
+- **Model** - HuggingFace model ID (e.g., `meta-llama/Llama-3.2-1B-Instruct`)
+- **Architecture** - Model architecture family (LLaMA, Mistral, Qwen, Phi, Gemma)
+- **Target** - Compilation target (e.g., `METAL`)
+- **Nodes** - Number of nodes in the computation graph
+- **Stats** - Compilation statistics (nodes after optimization, unique kernels, memory usage)
+
+### Extended Info (With --dump-ir)
+
+- Complete IR graph dump showing:
+  - Node IDs and operation types
+  - Tensor shapes and data types
+  - Data flow connections
+  - Kernel assignments
+
+## Examples
+
+### Basic Inspection
+
+```bash
+unc inspect llama3.unc
+```
+
+Output:
+```
+=== llama3.unc ===
+model:  meta-llama/Llama-3.2-1B-Instruct
+arch:   LLaMA
+target: METAL
+nodes:  234
+stats:  nodes_after=234, unique_kernels=18, activation_mb=512, kv_mb=256
+```
+
+### Dump Full IR
+
+```bash
+unc inspect llama3.unc --dump-ir
+```
+
+Output:
+```
+=== llama3.unc ===
+model:  meta-llama/Llama-3.2-1B-Instruct
+arch:   LLaMA
+target: METAL
+nodes:  234
+stats:  nodes_after=234, unique_kernels=18, activation_mb=512, kv_mb=256
+
+node_0: Input[shape=[1, seq_len], dtype=i32]
+node_1: Embedding[shape=[1, seq_len, 2048], dtype=f16, weight=embed_tokens]
+node_2: RMSNorm[shape=[1, seq_len, 2048], dtype=f16, eps=1e-6]
+node_3: QKVProj[shape=[1, seq_len, 2048], dtype=f16, ...]
+...
+```
+
+### Inspect Multiple Models
+
+```bash
+for model in *.unc; do
+  echo "\n--- $model ---"
+  unc inspect "$model"
+done
+```
+
+## Use Cases
+
+### Verify Compilation
+
+Check that your model compiled correctly:
+
+```bash
+unc compile --model meta-llama/Llama-3.2-1B-Instruct --output llama3.unc
+unc inspect llama3.unc
+```
+
+### Compare Quantization Impact
+
+Compare different quantization levels:
+
+```bash
+unc compile --model mistralai/Mistral-7B-v0.1 --quant f16 --output mistral-f16.unc
+unc compile --model mistralai/Mistral-7B-v0.1 --quant q4-0 --output mistral-q4.unc
+
+unc inspect mistral-f16.unc
+unc inspect mistral-q4.unc
+```
+
+### Debug Graph Issues
+
+Use `--dump-ir` to debug optimization or kernel assignment issues:
+
+```bash
+unc inspect problematic-model.unc --dump-ir > graph.txt
+# Analyze graph.txt to identify issues
+```
+
+## Understanding Stats
+
+The `stats` line shows key compilation metrics:
+
+- **nodes_after** - Number of nodes after optimization passes (fewer is usually better)
+- **unique_kernels** - Number of distinct Metal kernels required (affects compilation time)
+- **activation_mb** - Memory required for intermediate activations during forward pass
+- **kv_mb** - Memory required for key-value cache (scales with batch size and sequence length)
+
+## Tips
+
+<Tip>
+  Use `unc inspect` before `unc run` to verify the model loaded correctly and check memory requirements
+</Tip>
+
+<Tip>
+  The `--dump-ir` flag is useful for:
+  - Understanding model architecture at the operation level
+  - Debugging compilation issues
+  - Verifying quantization was applied correctly
+  - Contributing to UNC development
+</Tip>

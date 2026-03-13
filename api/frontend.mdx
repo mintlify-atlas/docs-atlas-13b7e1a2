@@ -1,0 +1,258 @@
+---
+title: 'Frontend Module'
+description: 'Model loading, config parsing, and architecture templates'
+---
+
+The frontend module handles HuggingFace model downloading, config.json parsing, and lowering models into UNC's intermediate representation.
+
+## Overview
+
+The frontend provides:
+- `ModelLoader` for downloading models from HuggingFace Hub
+- `parse_config()` for parsing config.json into model parameters
+- Architecture templates for LLaMA, Mistral, Qwen, Phi, and Gemma models
+
+## ModelLoader
+
+Downloader and loader for HuggingFace models with caching support.
+
+### Constructor
+
+<ParamField path="ModelLoader::new()" type="Result<Self>">
+  Creates a loader using the default HuggingFace cache directory (`~/.cache/huggingface`).
+</ParamField>
+
+<ParamField path="ModelLoader::with_cache(cache_dir, token)" type="Result<Self>">
+  Creates a loader with explicit cache directory and optional authentication token.
+  
+  **Parameters:**
+  - `cache_dir: PathBuf` - Custom cache directory path
+  - `token: Option<String>` - HuggingFace API token for private models
+</ParamField>
+
+### Methods
+
+<ParamField path="load(model_id)" type="Result<ModelFiles>">
+  Downloads and resolves all files for a model ID (e.g., `"meta-llama/Llama-3-8B"`).
+  
+  Returns `ModelFiles` containing:
+  - `config_json: PathBuf` - Path to config.json
+  - `tokenizer_json: Option<PathBuf>` - Path to tokenizer.json
+  - `weight_files: Vec<WeightFile>` - Safetensors or GGUF weight files
+  - `model_id: String` - Model identifier
+</ParamField>
+
+<ParamField path="load_revision(model_id, revision)" type="Result<ModelFiles>">
+  Downloads files for a specific revision/branch.
+  
+  **Parameters:**
+  - `model_id: &str` - HuggingFace model ID
+  - `revision: &str` - Git revision (branch, tag, or commit hash)
+</ParamField>
+
+### WeightFile Enum
+
+```rust
+pub enum WeightFile {
+    Safetensors { path: PathBuf, shard_index: Option<usize> },
+    Gguf { path: PathBuf },
+}
+```
+
+Represents a single weight file. Use `path()` method to get the file path.
+
+### Usage Example
+
+```rust
+use unc::frontend::huggingface::ModelLoader;
+
+// Load a model from HuggingFace
+let loader = ModelLoader::new()?;
+let model_files = loader.load("meta-llama/Llama-3.2-1B")?;
+
+println!("Config: {}", model_files.config_json.display());
+println!("Weights: {} files", model_files.weight_files.len());
+
+// Load with authentication
+let loader = ModelLoader::with_cache(
+    PathBuf::from("/custom/cache"),
+    Some("hf_...".to_string()),
+)?;
+let model_files = loader.load("meta-llama/Llama-3-70B")?;
+```
+
+## parse_config()
+
+Parses HuggingFace config.json into UNC model parameters.
+
+<ParamField path="parse_config(path)" type="Result<(ArchitectureFamily, ModelParams, Option<u32>, Option<u32>)>">
+  Parses config.json and returns:
+  - Architecture family (LLaMA, Mistral, Qwen, Phi, Gemma, GPTNeoX)
+  - Model parameters (hidden size, layers, heads, etc.)
+  - BOS token ID (optional)
+  - EOS token ID (optional)
+  
+  **Parameters:**
+  - `path: &Path` - Path to config.json
+</ParamField>
+
+### Supported Architectures
+
+| HuggingFace Class | UNC Family |
+|-------------------|------------|
+| `LlamaForCausalLM` | `ArchitectureFamily::LLaMA` |
+| `MistralForCausalLM` | `ArchitectureFamily::Mistral` |
+| `Qwen2ForCausalLM` | `ArchitectureFamily::Qwen` |
+| `PhiForCausalLM` | `ArchitectureFamily::Phi` |
+| `GemmaForCausalLM` | `ArchitectureFamily::Gemma` |
+| `GPTNeoXForCausalLM` | `ArchitectureFamily::GPTNeoX` |
+
+### ModelParams Structure
+
+```rust
+pub struct ModelParams {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    pub max_position_embeddings: usize,
+    pub rms_norm_eps: f64,
+    pub rope_theta: f64,
+    pub rope_scaling: Option<RoPEScaling>,
+    pub attention_type: AttentionType,  // MHA, GQA, or MQA
+    pub ffn_type: FFNType,              // Standard, SwiGLU, or GeGLU
+    pub tie_word_embeddings: bool,
+    pub qk_norm: bool,                   // Qwen3-style per-head normalization
+}
+```
+
+### Usage Example
+
+```rust
+use unc::frontend::config::parse_config;
+use std::path::Path;
+
+let (arch, params, bos_id, eos_id) = parse_config(
+    Path::new("model/config.json")
+)?;
+
+println!("Architecture: {:?}", arch);
+println!("Layers: {}, Heads: {}, Hidden: {}",
+    params.num_hidden_layers,
+    params.num_attention_heads,
+    params.hidden_size,
+);
+```
+
+## Architecture Templates
+
+Templates lower model parameters into computation graphs. Each architecture family has a dedicated template module.
+
+### llama::lower_llama()
+
+<ParamField path="lower_llama(params, weight_files, model_id, tokenizer_path, bos_token_id, eos_token_id)" type="CompGraph">
+  Constructs a LLaMA/LLaMA-2/LLaMA-3 computation graph.
+  
+  **Parameters:**
+  - `params: &ModelParams` - Model configuration
+  - `weight_files: &[WeightFile]` - Paths to weight files
+  - `model_id: &str` - Model identifier
+  - `tokenizer_path: Option<&str>` - Path to tokenizer.json
+  - `bos_token_id: Option<u32>` - Beginning-of-sequence token
+  - `eos_token_id: Option<u32>` - End-of-sequence token
+  
+  **Returns:** Pre-optimization CompGraph with placeholder weight offsets
+</ParamField>
+
+### mistral::lower_mistral()
+
+Same signature as `lower_llama()`. Supports Mistral and Mixtral models with sliding window attention.
+
+### qwen::lower_qwen()
+
+Same signature as `lower_llama()`. Supports Qwen-2 and Qwen-3 models with optional QK normalization.
+
+### phi::lower_phi()
+
+Same signature as `lower_llama()`. Supports Phi-2 and Phi-3 models with partial rotary embeddings.
+
+### gemma::lower_gemma()
+
+Same signature as `lower_llama()`. Supports Gemma and Gemma-2 models with GeGLU activation.
+
+### Template Usage
+
+```rust
+use unc::frontend::templates::llama::lower_llama;
+use unc::frontend::config::parse_config;
+use unc::frontend::huggingface::ModelLoader;
+
+let loader = ModelLoader::new()?;
+let files = loader.load("meta-llama/Llama-3.2-1B")?;
+let (arch, params, bos, eos) = parse_config(&files.config_json)?;
+
+let graph = lower_llama(
+    &params,
+    &files.weight_files,
+    &files.model_id,
+    files.tokenizer_json.as_deref().map(|p| p.to_str().unwrap()),
+    bos,
+    eos,
+);
+
+println!("Graph nodes: {}", graph.num_nodes());
+```
+
+## Complete Workflow
+
+```rust src/main.rs
+use unc::frontend::{
+    huggingface::ModelLoader,
+    config::parse_config,
+    templates,
+};
+use unc::ir::graph::ArchitectureFamily;
+
+// 1. Download model
+let loader = ModelLoader::new()?;
+let model_files = loader.load("meta-llama/Llama-3.2-1B")?;
+
+// 2. Parse config
+let (arch, params, bos, eos) = parse_config(&model_files.config_json)?;
+
+// 3. Lower to IR
+let tok_path = model_files.tokenizer_json
+    .as_deref()
+    .map(|p| p.to_str().unwrap());
+
+let graph = match arch {
+    ArchitectureFamily::LLaMA => templates::llama::lower_llama(
+        &params,
+        &model_files.weight_files,
+        &model_files.model_id,
+        tok_path,
+        bos,
+        eos,
+    ),
+    ArchitectureFamily::Mistral => templates::mistral::lower_mistral(
+        &params,
+        &model_files.weight_files,
+        &model_files.model_id,
+        tok_path,
+        bos,
+        eos,
+    ),
+    // ... other architectures
+    _ => panic!("Unsupported architecture"),
+};
+
+println!("Compilation graph ready: {} nodes", graph.num_nodes());
+```
+
+## Related
+
+- [IR Module](/api/ir) - Computation graph representation
+- [Compiler Module](/api/compiler) - Optimization passes

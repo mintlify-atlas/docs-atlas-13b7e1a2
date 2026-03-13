@@ -1,0 +1,586 @@
+---
+title: 'Benchmarking Guide'
+description: 'How to measure and compare UNC inference performance'
+---
+
+## Overview
+
+This guide explains how to benchmark UNC models, what metrics to track, and how to compare with other frameworks like mlx-lm.
+
+## Key Metrics
+
+### 1. Throughput
+
+**Definition**: Tokens generated per second (tok/s)
+
+**Why it matters**: Primary metric for generation speed
+
+**How to measure**:
+
+```bash
+unc run model.unc --prompt "The history of" --max-tokens 200
+# Output includes: "152.0 tok/s"
+```
+
+**What to report**:
+- Cold-start throughput (first 100-150 tokens)
+- Sustained throughput (after thermal throttling)
+- Average over multiple runs
+
+### 2. Latency
+
+**Definition**: Time per token in milliseconds (ms/tok)
+
+**Why it matters**: Affects perceived responsiveness
+
+**How to measure**:
+
+```bash
+# Latency = 1000 / throughput
+Throughput: 152 tok/s → Latency: 6.6 ms/tok
+```
+
+**What to report**:
+- Decode latency (per-token generation)
+- Prefill latency (prompt processing)
+- Time-to-first-token (TTFT)
+
+### 3. Memory Usage
+
+**Definition**: Peak RAM/GPU memory in GB
+
+**Why it matters**: Determines hardware requirements
+
+**How to measure**:
+
+```bash
+/usr/bin/time -l unc run model.unc --prompt "Test" --max-tokens 200 2>&1 | grep 'maximum resident set size'
+# Output: 4437913600 (bytes) → 4.24 GB
+```
+
+**What to report**:
+- Peak RSS (resident set size)
+- GPU memory usage (from Activity Monitor or Metal Profiler)
+- Memory breakdown (weights + activations + KV cache)
+
+### 4. Power Consumption
+
+**Definition**: GPU/CPU/SoC power in watts (W)
+
+**Why it matters**: Energy efficiency, thermal behavior, battery life
+
+**How to measure**:
+
+```bash
+brew install vladkens/tap/macmon
+macmon --hide cpu,gpu-e,gpu-p --interval 200 > power.log &
+MAC_PID=$!
+unc run model.unc --prompt "Test" --max-tokens 200
+kill $MAC_PID
+```
+
+**What to report**:
+- GPU power during decode (average, peak)
+- CPU power during decode
+- SoC (total system) power
+- Energy per token (mJ/token = W × 1000 / tok/s)
+
+### 5. Energy Efficiency
+
+**Definition**: Tokens generated per watt-hour (tok/Wh)
+
+**Why it matters**: Best metric for battery life and sustainability
+
+**How to calculate**:
+
+```
+Tokens per Wh = Throughput (tok/s) × 3600 (s/h) / Power (W)
+
+Example (UNC Q4_0 TinyLlama):
+  152 tok/s × 3600 / 11.3W = 48,400 tok/Wh
+  → 12,800 tokens per 1 Wh of GPU power
+```
+
+**What to report**:
+- Tokens per watt-hour (GPU)
+- Tokens per watt-hour (SoC)
+- Energy per token (mJ/token)
+
+## Benchmarking UNC Models
+
+### Basic Benchmark
+
+```bash
+#!/bin/bash
+# basic_benchmark.sh
+
+MODEL="$1"
+PROMPT="The history of"
+TOKENS=200
+
+echo "=== Benchmarking $MODEL ==="
+echo ""
+
+# Run 3 times, report average
+for i in {1..3}; do
+  echo "Run $i:"
+  unc run "$MODEL" --prompt "$PROMPT" --max-tokens $TOKENS
+  sleep 30  # Cool down between runs
+done
+```
+
+Usage:
+
+```bash
+chmod +x basic_benchmark.sh
+./basic_benchmark.sh model.unc
+```
+
+### Detailed Benchmark
+
+```bash
+#!/bin/bash
+# detailed_benchmark.sh
+
+MODEL="$1"
+PROMPT="The history of"
+TOKENS=200
+
+echo "=== Detailed Benchmark: $MODEL ==="
+echo ""
+
+# Throughput
+echo "[1/3] Measuring throughput..."
+THROUGHPUT=$(unc run "$MODEL" --prompt "$PROMPT" --max-tokens $TOKENS 2>&1 | \
+  grep -oE '[0-9]+\.[0-9]+ tok/s' | awk '{print $1}')
+echo "Throughput: $THROUGHPUT tok/s"
+echo ""
+
+sleep 30
+
+# Memory
+echo "[2/3] Measuring memory..."
+MEMORY=$(/usr/bin/time -l unc run "$MODEL" --prompt "$PROMPT" --max-tokens $TOKENS 2>&1 | \
+  grep 'maximum resident set size' | awk '{print $1}')
+MEMORY_GB=$(echo "scale=2; $MEMORY / 1024 / 1024 / 1024" | bc)
+echo "Peak memory: $MEMORY_GB GB"
+echo ""
+
+sleep 30
+
+# Power (requires macmon)
+echo "[3/3] Measuring power..."
+if command -v macmon &> /dev/null; then
+  macmon --hide cpu,gpu-e,gpu-p --interval 200 > power.log 2>&1 &
+  MAC_PID=$!
+  sleep 2
+  unc run "$MODEL" --prompt "$PROMPT" --max-tokens $TOKENS > /dev/null 2>&1
+  sleep 2
+  kill $MAC_PID
+  
+  # Parse average GPU power (simplified)
+  GPU_POWER=$(grep -oE 'GPU.*[0-9]+\.[0-9]+W' power.log | \
+    awk '{sum+=$NF; count++} END {print sum/count}')
+  echo "GPU power: ${GPU_POWER}W (approx)"
+  rm power.log
+else
+  echo "macmon not installed. Skipping power measurement."
+  echo "Install: brew install vladkens/tap/macmon"
+fi
+
+echo ""
+echo "=== Summary ==="
+echo "Throughput: $THROUGHPUT tok/s"
+echo "Memory: $MEMORY_GB GB"
+if [ -n "$GPU_POWER" ]; then
+  ENERGY=$(echo "scale=1; $GPU_POWER * 1000 / $THROUGHPUT" | bc)
+  TOKENS_PER_WH=$(echo "scale=0; $THROUGHPUT * 3600 / $GPU_POWER" | bc)
+  echo "GPU power: ${GPU_POWER}W"
+  echo "Energy/token: ${ENERGY} mJ"
+  echo "Tokens/Wh: $TOKENS_PER_WH"
+fi
+```
+
+## Comparing with mlx-lm
+
+### Setup mlx-lm
+
+```bash
+pip install mlx-lm
+```
+
+### Benchmark mlx-lm
+
+```bash
+# Install model (first time)
+python -m mlx_lm.convert --hf-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --quantize --q-bits 4 --q-group-size 64
+
+# Run inference
+time python -m mlx_lm.generate \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --prompt "The history of" \
+  --max-tokens 200
+```
+
+### Head-to-Head Comparison
+
+```bash
+#!/bin/bash
+# compare_mlx.sh
+
+MODEL_ID="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+PROMPT="The history of"
+TOKENS=200
+
+echo "=== UNC vs mlx-lm Comparison ==="
+echo ""
+
+# UNC
+echo "[UNC Q4_0]"
+unc run tinyllama.unc --prompt "$PROMPT" --max-tokens $TOKENS
+echo ""
+
+sleep 30
+
+# mlx-lm
+echo "[mlx-lm Q4]"
+python -m mlx_lm.generate \
+  --model "$MODEL_ID" \
+  --prompt "$PROMPT" \
+  --max-tokens $TOKENS
+```
+
+### Real Results (M1 Pro)
+
+| Framework | Quantization | Throughput | GPU Power | Energy/Token | Memory | CPU Instructions |
+|-----------|--------------|------------|-----------|--------------|--------|------------------|
+| **UNC**   | Q4_0         | 152 tok/s  | 11.3W     | 74 mJ        | 4.2 GB | 5.3B (200 tok)   |
+| **mlx-lm**| Q4           | 113 tok/s  | 14.1W     | 125 mJ       | 0.9 GB | 31.4B (200 tok)  |
+| **Speedup** | —          | **1.35x**  | **-25%**  | **1.7x**     | 4.7x   | **0.17x** (better) |
+
+Key takeaways:
+- UNC is 35% faster while using 25% less GPU power
+- UNC is 1.7x more energy-efficient per token
+- UNC uses 8.4x fewer CPU instructions (no Python overhead)
+- mlx-lm uses 4.7x less memory (loads quantized weights directly)
+
+## Methodology Best Practices
+
+### Hardware Consistency
+
+1. **Cool down**: Wait 15-30 seconds between runs
+2. **Close apps**: Quit unnecessary applications
+3. **Power settings**: Keep plugged in, disable Low Power Mode
+4. **Thermal state**: Start from same temperature (~66-70°C GPU)
+
+### Measurement Consistency
+
+1. **Same prompts**: Use identical prompts for A/B tests
+2. **Same token count**: Generate same number of tokens
+3. **Multiple runs**: Average 3-5 runs, discard outliers
+4. **Identify phases**: Separate prefill (prompt processing) from decode
+
+### Decode Phase Identification
+
+For fair comparisons, measure only the decode phase:
+
+1. **Start timing**: After prompt is processed
+2. **Stop timing**: After last token generated
+3. **Exclude init**: Don't include model loading time
+
+For power measurements:
+
+1. **Start logging**: When GPU utilization > 50%
+2. **Stop logging**: When GPU utilization drops
+3. **Average**: Use mean power during decode phase
+
+### Reproducibility Checklist
+
+- [ ] Document hardware (chip, memory, macOS version)
+- [ ] Document model (name, quantization, context length)
+- [ ] Document prompt and token count
+- [ ] Document tool versions (unc, mlx-lm, macmon)
+- [ ] Document thermal state (starting GPU temp)
+- [ ] Document power settings (plugged in, Low Power Mode off)
+- [ ] Run multiple times, report mean ± std dev
+
+## Real Benchmark Data
+
+### TinyLlama 1.1B Q4_0 (M1 Pro)
+
+**Hardware**: Apple M1 Pro (14 GPU cores, 16GB, 200 GB/s)
+**Software**: UNC (JIT), macOS 14.3, macmon 200ms sampling
+**Methodology**: 200 tokens generated, prompt "The history of", 15-30s cooldown between runs
+
+| Metric | Value |
+|--------|-------|
+| **Throughput (cold)** | 152.0 tok/s |
+| **Throughput (warm)** | 100-110 tok/s |
+| **Decode latency (cold)** | 6.36 ms/tok |
+| **Decode latency (warm)** | 8.3-10.0 ms/tok |
+| **GPU power (decode)** | 11.2W avg |
+| **CPU power (decode)** | 0.9W avg |
+| **SoC power (decode)** | 12.1W avg |
+| **Energy per token (GPU)** | 74 mJ |
+| **Energy per token (SoC)** | 80 mJ |
+| **Tokens per Wh (GPU)** | 12,800 |
+| **Tokens per Wh (SoC)** | 11,300 |
+| **Peak RSS** | 4.24 GB |
+| **Instructions (200 tok)** | 5.33B |
+| **GPU utilization** | 88% |
+| **GPU temp (decode)** | 70-75°C |
+| **Init time** | 1.7s (cached) |
+| **Binary size** | 544 KB + 1.1 GB weights |
+
+### Qwen3-4B Q4_0 (M1 Pro)
+
+| Metric | Value |
+|--------|-------|
+| **Throughput (cold)** | 38.7 tok/s |
+| **Decode latency** | 22.9-23.0 ms/tok |
+| **Q4_0 weights** | 2.26 GB |
+| **Dispatches per decode** | ~399 |
+
+### UNC vs mlx-lm Comparison (TinyLlama 1.1B Q4_0)
+
+| Metric | UNC | mlx-lm | UNC Advantage |
+|--------|-----|--------|---------------|
+| Throughput | 152 tok/s | 112.7 tok/s | 1.35x faster |
+| GPU power | 11.2W | 14.1W | 25% less |
+| CPU power | 0.9W | 2.1W | 57% less |
+| SoC power | 12.1W | 16.2W | 25% less |
+| Energy/token (GPU) | 74 mJ | 125 mJ | 1.7x more efficient |
+| Energy/token (SoC) | 80 mJ | 144 mJ | 1.8x more efficient |
+| Tokens/Wh (GPU) | 12,800 | 8,000 | 1.6x more |
+| Peak RSS | 4.24 GB | 0.87 GB | 4.9x more (UNC) |
+| CPU instructions (200 tok) | 5.33B | 31.4B | 5.9x fewer |
+| GPU utilization | 88% | 88% | Same |
+| GPU temp | 72°C | 74°C | 2°C cooler |
+
+**Summary**: UNC is faster, more efficient, and uses less power than mlx-lm, at the cost of higher memory usage (due to loading BF16 weights before quantization).
+
+## Power Measurement with macmon
+
+### Installation
+
+```bash
+brew install vladkens/tap/macmon
+```
+
+### Real-Time Monitoring
+
+```bash
+# Monitor during inference
+macmon --hide cpu,gpu-e,gpu-p --interval 200
+
+# In another terminal:
+unc run model.unc --prompt "Test" --max-tokens 200
+```
+
+Example output during decode:
+
+```
+ GPU: ████████████████████████████████████  11.2W
+ CPU: ███                                    0.9W
+ SOC: ██████████████████████████████████████ 12.1W
+```
+
+### Logging for Analysis
+
+```bash
+# Log to file
+macmon --hide cpu,gpu-e,gpu-p --interval 200 > power.log 2>&1 &
+MAC_PID=$!
+
+# Run inference
+unc run model.unc --prompt "Test" --max-tokens 200
+
+# Stop logging
+kill $MAC_PID
+
+# Parse average GPU power
+grep -oE '[0-9]+\.[0-9]+W' power.log | awk '{sum+=$1; count++} END {print sum/count}'
+```
+
+### Power Trace Visualization
+
+UNC decode phase power trace (TinyLlama Q4_0):
+
+```
+GPU Power (11.2W avg):
+████████████████████████████████████████████  11.2W
+
+CPU Power (0.9W avg):
+███                                            0.9W
+
+SoC Power (12.1W avg):
+█████████████████████████████████████████████████ 12.1W
+```
+
+mlx-lm decode phase power trace (TinyLlama Q4):
+
+```
+GPU Power (14.1W avg):
+████████████████████████████████████████████████████████ 14.1W
+
+CPU Power (2.1W avg):
+████████                                                  2.1W
+
+SoC Power (16.2W avg):
+█████████████████████████████████████████████████████████████████████ 16.2W
+```
+
+## Memory Profiling
+
+### Peak RSS
+
+```bash
+/usr/bin/time -l unc run model.unc --prompt "Test" --max-tokens 200 2>&1 | \
+  grep 'maximum resident set size'
+```
+
+### Memory Breakdown
+
+From compile output:
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o model.unc
+# Output:
+#   compile: 245 nodes, 89 kernels, activation=312 MB, kv=256 MB
+```
+
+| Component | Size | Source |
+|-----------|------|--------|
+| Q4_0 weights | 618 MB | Model parameters |
+| Activations | 312 MB | Compile output |
+| KV cache | 256 MB | Compile output (4096 ctx) |
+| Overhead | ~1.5 GB | Metal framework, buffers |
+| **Total** | **~2.7 GB** | Theoretical |
+| **Peak RSS** | **4.2 GB** | Measured (/usr/bin/time) |
+
+## Thermal Profiling
+
+### Temperature Monitoring
+
+```bash
+# Monitor GPU temp
+macmon --hide cpu,gpu-p --interval 1000
+```
+
+### Thermal Behavior (TinyLlama Q4_0)
+
+| Phase | Duration | GPU Temp | Throughput |
+|-------|----------|----------|------------|
+| Idle | — | 66-70°C | — |
+| Cold start | 0-100 tok | 70-72°C | 152 tok/s |
+| Warming | 100-150 tok | 72-74°C | 140-150 tok/s |
+| Throttled | 150+ tok | 74-75°C | 100-110 tok/s |
+
+### Throttling Analysis
+
+```
+Performance vs Time (TinyLlama Q4_0)
+
+160 ┤           ╭──╮
+    │          ╱    ╲
+120 ┤         ╱      ╲_______________
+    │        ╱
+ 80 ┤    ╭──╯
+    │   ╱
+ 40 ┤  ╱
+    │ ╱
+  0 ┼─────────────────────────────────
+    0   50  100 150 200 250 300 350 (tokens)
+    
+Cold   →  Warm  →  Sustained
+```
+
+## Bandwidth Analysis
+
+### Calculating Effective Bandwidth
+
+```
+Effective bandwidth = Weight size × Throughput
+
+Example (TinyLlama Q4_0):
+  Weight size: 618 MB
+  Throughput: 152 tok/s
+  
+  Bandwidth = 618 MB × 152 tok/s = 93,936 MB/s ≈ 97 GB/s
+  Utilization = 97 GB/s / 200 GB/s = 48%
+```
+
+### Why Not 100%?
+
+1. **Non-GEMM ops**: RMSNorm, RoPE, SDPA (compute-bound)
+2. **KV cache**: Additional memory traffic
+3. **Activations**: Intermediate tensor reads/writes
+4. **Dequantization**: GPU cycles for Q4_0 → F16
+
+## Tools Reference
+
+### macmon (Power Monitoring)
+
+```bash
+brew install vladkens/tap/macmon
+macmon --help
+
+# Common usage:
+macmon --hide cpu,gpu-e,gpu-p --interval 200
+```
+
+### /usr/bin/time (CPU & Memory)
+
+```bash
+/usr/bin/time -l <command>
+
+# Key metrics:
+# - maximum resident set size: Peak RSS (bytes)
+# - instructions retired: CPU instruction count
+# - voluntary context switches: Scheduler switches
+```
+
+### Xcode Instruments (GPU Profiling)
+
+1. Open Instruments.app
+2. Choose "Metal System Trace"
+3. Launch UNC binary
+4. Profile decode phase
+5. Analyze kernel dispatch, bandwidth, utilization
+
+### Activity Monitor (Real-Time)
+
+1. Open Activity Monitor
+2. View → GPU History
+3. Run inference
+4. Observe GPU utilization graph
+
+## Reporting Benchmarks
+
+### Minimum Information
+
+- **Hardware**: Chip (M1 Pro), memory (16GB), bandwidth (200 GB/s)
+- **Software**: UNC version, macOS version
+- **Model**: Name, parameter count, quantization
+- **Throughput**: Tok/s (cold and/or warm)
+- **Memory**: Peak RSS in GB
+
+### Comprehensive Report
+
+Include all metrics from the [Real Benchmark Data](#real-benchmark-data) section:
+
+- Throughput (cold, warm)
+- Latency (decode, prefill)
+- Power (GPU, CPU, SoC)
+- Energy efficiency (mJ/token, tok/Wh)
+- Memory (peak RSS, breakdown)
+- CPU instructions
+- GPU utilization
+- Thermal behavior
+
+## Next Steps
+
+- Apply findings with [Performance Tuning](/guides/performance-tuning)
+- Understand precision tradeoffs in [Quantization](/guides/quantization)
+- Choose models from [Supported Models](/guides/supported-models)

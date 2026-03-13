@@ -1,0 +1,242 @@
+---
+title: 'Quantization Guide'
+description: 'Understanding quantization in UNC: levels, tradeoffs, and performance'
+---
+
+## What is Quantization?
+
+Quantization reduces the precision of model weights to decrease memory usage and increase inference speed. Instead of storing each weight as a 32-bit or 16-bit floating-point number, quantization uses lower-precision formats like 8-bit or 4-bit integers.
+
+### Why Quantization Matters
+
+- **Faster inference**: Lower precision means less data to move through memory, leading to higher token throughput
+- **Reduced memory footprint**: Smaller models fit in GPU memory more easily
+- **Energy efficiency**: Less memory bandwidth usage reduces power consumption
+- **Model distribution**: Smaller model files are easier to download and distribute
+
+For Apple Silicon GPUs, memory bandwidth is often the bottleneck. A 4-bit quantized model can be **3x faster** than the same model in 16-bit precision because it moves less data per token.
+
+## Available Quantization Levels
+
+UNC supports five quantization levels, specified via the `--quant` flag:
+
+### F32 (32-bit Float)
+- **Precision**: Full 32-bit IEEE 754 floating point
+- **Use case**: Maximum accuracy for research or debugging
+- **Size**: Baseline (4 bytes per weight)
+- **Speed**: Slowest (limited by bandwidth)
+- **Note**: Not commonly used for inference
+
+### F16 (16-bit Float)
+- **Precision**: IEEE 754 half-precision (16-bit)
+- **Use case**: High accuracy with moderate performance
+- **Size**: 50% of F32
+- **Speed**: Moderate
+- **Quality**: Virtually no accuracy loss vs F32
+
+### BF16 (BFloat16)
+- **Precision**: Brain Float 16 (16-bit with 8-bit exponent)
+- **Use case**: Training-compatible format, good for fine-tuned models
+- **Size**: 50% of F32 (same as F16)
+- **Speed**: Similar to F16
+- **Quality**: Better dynamic range than F16, good for edge cases
+
+### Q8_0 (8-bit Integer)
+- **Precision**: 8-bit integer with per-block scaling
+- **Use case**: Balance between quality and performance
+- **Size**: 25% of F32
+- **Speed**: 1.6x faster than F16
+- **Quality**: Minimal perceptual degradation for most models
+
+### Q4_0 (4-bit Integer)
+- **Precision**: 4-bit integer with per-block scaling
+- **Use case**: Maximum speed and smallest size
+- **Size**: 12.5% of F32
+- **Speed**: 3.2x faster than F16
+- **Quality**: Small quality loss, acceptable for most applications
+
+## Performance Data
+
+### TinyLlama 1.1B on Apple M1 Pro
+
+| Quantization | Model Size | Throughput | Relative Speed | Quality |
+|--------------|------------|------------|----------------|----------|
+| **F16**      | 2.2 GB     | 47.9 tok/s | 1.0x (baseline)| Perfect  |
+| **Q8_0**     | 1.1 GB     | 76.6 tok/s | 1.6x           | ~99%     |
+| **Q4_0**     | 0.6 GB     | 152.0 tok/s| 3.2x           | ~95%     |
+
+### Size vs Speed Tradeoffs
+
+```
+Model Size (TinyLlama 1.1B)
+F16  ████████████████████████████████████████████  2.2 GB
+Q8_0 ██████████████████████                       1.1 GB
+Q4_0 ████████████                                 0.6 GB
+
+Inference Speed (TinyLlama 1.1B)
+Q4_0 ████████████████████████████████████████████████████████████  152.0 tok/s
+Q8_0 ███████████████████████████████                               76.6 tok/s
+F16  ███████████████████                                           47.9 tok/s
+```
+
+### Energy Efficiency (Q4_0 vs F16)
+
+Quantization also dramatically improves energy efficiency:
+
+| Metric | Q4_0 | F16 | Improvement |
+|--------|------|-----|-------------|
+| GPU Power | 11.3W | ~15W | 25% less |
+| Throughput | 152 tok/s | 47.9 tok/s | 3.2x faster |
+| Energy per token | 74 mJ | ~313 mJ | 4.2x more efficient |
+
+## When to Use Each Level
+
+### Use F16 when:
+- You need maximum accuracy for research or evaluation
+- Model quality is more important than speed
+- You have ample GPU memory (>32GB)
+- You're debugging precision issues
+
+### Use BF16 when:
+- Your model was trained or fine-tuned in BF16
+- You need better numerical stability than F16
+- You're working with models that have large activation ranges
+
+### Use Q8_0 when:
+- You want a good balance between quality and speed
+- You need high accuracy but faster than F16
+- You have moderate memory constraints
+- You're deploying production models where quality matters
+
+### Use Q4_0 when:
+- You want maximum throughput
+- Memory is very constrained (&lt;8GB)
+- Slight quality loss is acceptable
+- You're deploying chatbots, assistants, or real-time applications
+- Energy efficiency is critical (battery-powered devices)
+
+## How Quantization Works in UNC
+
+### Compile-Time vs Runtime Quantization
+
+UNC supports two quantization modes:
+
+#### 1. Runtime Quantization (Current Default)
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0
+```
+
+With runtime quantization:
+- Weights are loaded from HuggingFace in their original format (usually F16 or BF16)
+- Quantization happens during model initialization
+- The compiled `.unc` bundle references the original weight files
+- First run loads BF16 weights, quantizes them in memory, then runs inference
+
+**Pros**: No need to store quantized weights separately
+**Cons**: Slightly higher memory usage during init, requires original weights
+
+#### 2. Compile-Time Quantization (AOT)
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 --binary
+```
+
+With AOT compilation:
+- Weights are quantized during compilation
+- The standalone binary embeds quantized weights
+- No dependency on HuggingFace cache
+- Lower memory usage (no BF16 intermediate)
+
+**Pros**: Standalone binary, lower runtime memory
+**Cons**: Larger binary file (weights embedded)
+
+### Quantization Schemes
+
+UNC uses **block-wise quantization** for Q8_0 and Q4_0:
+
+1. **Block size**: Typically 32 or 64 elements
+2. **Per-block scaling**: Each block has its own scale factor
+3. **Zero-point**: Optional zero-point for asymmetric ranges
+
+This preserves more precision than naive uniform quantization:
+
+```
+Original weights:  [0.1, 0.15, 0.12, 0.08, -0.5, -0.6, -0.55, -0.52]
+                    ↓
+Block 1 (positive): scale=0.15/127, zero=0
+  → Q8_0: [85, 127, 102, 68]
+Block 2 (negative): scale=0.6/127, zero=0
+  → Q8_0: [-106, -127, -117, -110]
+```
+
+### Metal Implementation
+
+UNC's Metal kernels use specialized quantized matrix-vector multiplication:
+
+- **Q4_0**: Fused dequantization + GEMV kernel
+- **Q8_0**: SIMD-optimized int8 dot products
+- **F16/BF16**: Native half-precision GEMM
+
+The kernels are optimized for Apple Silicon's GPU architecture, achieving near-peak memory bandwidth utilization (48% of theoretical 200 GB/s on M1 Pro).
+
+## Quantization Command Examples
+
+### Compile with Q4_0 (fastest)
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o tinyllama_q4
+```
+
+### Compile with Q8_0 (balanced)
+```bash
+unc compile --model Qwen/Qwen3-4B --quant q8-0 -o qwen3_q8
+```
+
+### Compile with F16 (max quality)
+```bash
+unc compile --model mistralai/Mistral-7B-v0.3 --quant f16 -o mistral_f16
+```
+
+### AOT binary with embedded Q4_0 weights
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 --binary -o tinyllama_standalone
+```
+
+## Quality Considerations
+
+### When Q4_0 Works Well
+- Chat models with conversational fine-tuning
+- Instruction-following models
+- General-purpose LLMs (LLaMA, Mistral, Qwen)
+- Models >3B parameters (larger = more redundancy)
+
+### When to Avoid Q4_0
+- Very small models (&lt;1B) — less redundancy to exploit
+- Code generation requiring exact syntax
+- Math or reasoning tasks requiring high precision
+- Domain-specific models with critical accuracy requirements
+
+### Testing Quality
+
+Always benchmark your specific use case:
+
+1. Run reference prompts with F16:
+   ```bash
+   unc run model_f16.unc --prompt "Your test prompt" --max-tokens 200
+   ```
+
+2. Run same prompts with Q4_0:
+   ```bash
+   unc run model_q4.unc --prompt "Your test prompt" --max-tokens 200
+   ```
+
+3. Compare outputs qualitatively or use metrics like:
+   - BLEU/ROUGE for generation quality
+   - Perplexity for language modeling
+   - Task-specific accuracy (classification, reasoning, etc.)
+
+## Next Steps
+
+- Learn about [Performance Tuning](/guides/performance-tuning) to optimize inference speed
+- See [Supported Models](/guides/supported-models) for architecture-specific guidance
+- Read [Benchmarking](/guides/benchmarking) to measure your model's performance

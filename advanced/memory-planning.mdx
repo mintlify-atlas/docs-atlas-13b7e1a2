@@ -1,0 +1,469 @@
+---
+title: Memory Allocation and Planning
+description: How UNC allocates GPU memory with lifetime-based buffer aliasing
+---
+
+# Memory Allocation and Planning
+
+UNC's memory planner computes a static allocation plan at compile time, using lifetime analysis to alias activation buffers and minimize peak memory usage.
+
+## Memory Layout Overview
+
+UNC allocates three types of GPU buffers:
+
+```rust
+pub struct MemoryPlan {
+    pub activation_buffers: Vec<BufferAllocation>,  // Temporary activations
+    pub kv_cache: KVCacheLayout,                    // Key/Value cache
+    pub total_activation_bytes: usize,              // Peak activation memory
+    pub total_kv_cache_bytes: usize,                // KV cache size
+    pub total_weight_bytes: usize,                  // Model weights
+    pub decode_regions: Vec<DecodeRegion>,          // Decode-mode split buffers
+}
+```
+
+### Buffer Types
+
+| Buffer | Purpose | Size (Llama-2-7B) | Lifetime |
+|--------|---------|-------------------|----------|
+| **Weights** | Model parameters (Q4_0) | ~3.5 GB | Persistent |
+| **KV Cache** | Key/value tensors for all layers | 1-4 GB | Persistent |
+| **Activations** | Intermediate tensors | 256 MB (prefill) | Per-forward |
+| **Decode Regions** | Compact decode buffers | 32 MB (decode) | Per-forward |
+
+---
+
+## Activation Memory Planning
+
+### Lifetime Analysis
+
+The memory planner computes when each activation tensor is first written and last read:
+
+```rust
+fn compute_liveness(graph: &CompGraph) -> HashMap<TensorId, BufferLifetime> {
+    let mut liveness: HashMap<TensorId, BufferLifetime> = HashMap::new();
+    
+    for (node_idx, node) in graph.nodes.iter().enumerate() {
+        // Output tensor is first written here
+        let tid = node.output;
+        if let Some(t) = graph.tensors.get(&tid) {
+            if matches!(t.storage, StorageClass::Activation { .. }) {
+                let entry = liveness.entry(tid).or_insert(BufferLifetime {
+                    first_write: node_idx,
+                    last_read: node_idx,
+                });
+                entry.first_write = entry.first_write.min(node_idx);
+            }
+        }
+        
+        // Input tensors are last read at this node
+        for input_tid in &node.inputs {
+            if let Some(t) = graph.tensors.get(input_tid) {
+                if matches!(t.storage, StorageClass::Activation { .. }) {
+                    let entry = liveness.entry(*input_tid).or_insert(BufferLifetime {
+                        first_write: node_idx,
+                        last_read: node_idx,
+                    });
+                    entry.last_read = entry.last_read.max(node_idx);
+                }
+            }
+        }
+    }
+    
+    liveness
+}
+```
+
+**Example:**
+```
+Node 0: x1 = Gather(token_ids)         // x1 lifetime: [0, 1]
+Node 1: x2 = RMSNorm(x1)                // x2 lifetime: [1, 2]
+Node 2: q = MatMul(x2, Wq)              // q lifetime: [2, 5]
+Node 3: k = MatMul(x2, Wk)              // k lifetime: [3, 5]
+Node 4: v = MatMul(x2, Wv)              // v lifetime: [4, 5] (x2 last read)
+Node 5: attn_out = SDPA(q, k, v)       // attn_out lifetime: [5, 6]
+```
+
+---
+
+## Buffer Aliasing with Interval Coloring
+
+Tensors with non-overlapping lifetimes can share the same buffer:
+
+```rust
+pub fn plan_memory(graph: &CompGraph) -> MemoryPlan {
+    let liveness = compute_liveness(graph);
+    
+    // Sort activations by size descending (better packing)
+    let mut activations: Vec<(TensorId, usize, BufferLifetime)> = liveness
+        .into_iter()
+        .map(|(tid, lt)| {
+            let t = graph.tensor(tid);
+            let size = t.max_size_bytes();
+            (tid, size, lt)
+        })
+        .collect();
+    activations.sort_by(|a, b| b.1.cmp(&a.1)); // Largest first
+    
+    let mut buffers: Vec<BufferAllocation> = Vec::new();
+    
+    for (tid, size, lt) in &activations {
+        // Try to reuse existing buffer (non-overlapping lifetime, sufficient size)
+        let reused = buffers.iter_mut().find(|b| {
+            !b.lifetime.overlaps(lt) && b.size_bytes >= *size
+        });
+        
+        if let Some(buf) = reused {
+            // Reuse — extend lifetime to cover both uses
+            buf.lifetime.first_write = buf.lifetime.first_write.min(lt.first_write);
+            buf.lifetime.last_read = buf.lifetime.last_read.max(lt.last_read);
+            buf.aliases.push(*tid);
+        } else {
+            // Allocate new buffer
+            let offset = buffers.iter()
+                .map(|b| b.offset + b.size_bytes)
+                .max()
+                .unwrap_or(0);
+            let offset = (offset + 15) & !15; // 16-byte alignment
+            buffers.push(BufferAllocation {
+                id: BufferId(buffers.len() as u32),
+                size_bytes: *size,
+                offset,
+                aliases: vec![*tid],
+                lifetime: *lt,
+            });
+        }
+    }
+    
+    let total_activation_bytes = buffers.iter()
+        .map(|b| b.offset + b.size_bytes)
+        .max()
+        .unwrap_or(0);
+}
+```
+
+### Lifetime Overlap Check
+
+```rust
+impl BufferLifetime {
+    pub fn overlaps(&self, other: &BufferLifetime) -> bool {
+        self.first_write <= other.last_read && 
+        other.first_write <= self.last_read
+    }
+}
+```
+
+**Example:**
+```
+Buffer 0: [x1 (0-1), x3 (7-8)]      — Reused (lifetimes don't overlap)
+Buffer 1: [x2 (1-4), x6 (9-10)]     — Reused
+Buffer 2: [q (2-5), k (3-5), v (4-5)] — Overlap! Cannot alias q with k
+Buffer 3: [attn_out (5-6)]
+```
+
+---
+
+## KV Cache Layout
+
+### Structure
+
+The KV cache stores attention keys and values for all layers:
+
+```rust
+pub struct KVCacheLayout {
+    pub layers: Vec<KVCacheLayerLayout>,
+    pub total_bytes: usize,
+}
+
+pub struct KVCacheLayerLayout {
+    pub layer_idx: usize,
+    pub key_offset: usize,        // Byte offset for this layer's K cache
+    pub key_size_bytes: usize,    // [num_kv_heads, max_seq, head_dim] in f16
+    pub value_offset: usize,      // Byte offset for this layer's V cache
+    pub value_size_bytes: usize,
+    pub dtype: DType,             // Always F16
+}
+```
+
+### Size Calculation
+
+```rust
+fn plan_kv_cache(graph: &CompGraph) -> KVCacheLayout {
+    let p = &graph.metadata.params;
+    let num_layers = p.num_hidden_layers;
+    let kv_heads = p.num_kv_heads;
+    let head_dim = p.head_dim;
+    let max_seq = p.max_position_embeddings;
+    let bytes_per_elem = 2usize; // f16
+    
+    let per_layer_key_bytes = kv_heads * max_seq * head_dim * bytes_per_elem;
+    let per_layer_val_bytes = kv_heads * max_seq * head_dim * bytes_per_elem;
+    
+    let mut layers = Vec::with_capacity(num_layers);
+    let mut offset = 0usize;
+    
+    for layer_idx in 0..num_layers {
+        let key_offset = offset;
+        offset += per_layer_key_bytes;
+        let value_offset = offset;
+        offset += per_layer_val_bytes;
+        
+        layers.push(KVCacheLayerLayout {
+            layer_idx,
+            key_offset,
+            key_size_bytes: per_layer_key_bytes,
+            value_offset,
+            value_size_bytes: per_layer_val_bytes,
+            dtype: DType::F16,
+        });
+    }
+    
+    KVCacheLayout { total_bytes: offset, layers }
+}
+```
+
+**Llama-2-7B example:**
+```
+num_kv_heads = 32 (GQA)
+head_dim = 128
+max_seq = 4096
+num_layers = 32
+
+Per-layer K: 32 × 4096 × 128 × 2 = 33,554,432 bytes (32 MB)
+Per-layer V: 32 MB
+Total KV cache: 32 layers × 64 MB = 2,048 MB (2 GB)
+```
+
+---
+
+## Decode Regions: Split Buffers for Concurrent Dispatch
+
+### Problem
+
+Metal's barrier system operates at buffer granularity. If all activations share one buffer, every dispatch needs a full-scope barrier:
+
+```objc
+[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]; // Expensive!
+```
+
+### Solution: Per-Buffer Regions
+
+The memory planner creates separate decode buffers for each aliased group:
+
+```rust
+pub struct DecodeRegion {
+    pub region_id: u32,
+    pub size_bytes: usize,        // Max decode size of all aliased tensors
+    pub tensors: Vec<TensorId>,   // Tensors aliased to this region
+}
+```
+
+**Build decode regions from activation buffers:**
+
+```rust
+let mut decode_regions = Vec::with_capacity(buffers.len());
+let mut decode_tensor_region: HashMap<TensorId, u32> = HashMap::new();
+
+for buf in &buffers {
+    let region_id = buf.id.0;
+    let mut max_decode_bytes = 0usize;
+    
+    for &tid in &buf.aliases {
+        let t = graph.tensor(tid);
+        let decode_bytes = t.decode_size_bytes(); // Size when seq_len=1
+        max_decode_bytes = max_decode_bytes.max(decode_bytes);
+        decode_tensor_region.insert(tid, region_id);
+    }
+    
+    max_decode_bytes = (max_decode_bytes + 15) & !15; // 16-byte align
+    
+    decode_regions.push(DecodeRegion {
+        region_id,
+        size_bytes: max_decode_bytes,
+        tensors: buf.aliases.clone(),
+    });
+}
+```
+
+**Selective barriers (from barrier analysis):**
+
+```objc
+// Only barrier the specific regions that have conflicts
+[encoder memoryBarrierWithResources:@[
+    s->act_r[2],  // Region 2 has pending write
+    s->act_r[5]   // Region 5 has pending write
+] afterStages:MTLBarrierStageFragment beforeStages:MTLBarrierStageVertex];
+```
+
+**Performance:** Reduces barrier count by ~40% vs full-scope barriers.
+
+---
+
+## Total Memory Budget
+
+### Peak Memory Calculation
+
+```rust
+pub fn total_memory_budget(plan: &MemoryPlan, prefill_seq: usize) -> usize {
+    let weight_mem = plan.total_weight_bytes;
+    let kv_mem = plan.total_kv_cache_bytes;
+    let act_mem = if prefill_seq > 1 {
+        plan.total_activation_bytes  // Full [h, N_max] layout
+    } else {
+        plan.decode_regions.iter().map(|r| r.size_bytes).sum()  // Compact
+    };
+    
+    weight_mem + kv_mem + act_mem
+}
+```
+
+**Llama-2-7B (Q4_0, max_seq=4096):**
+
+| Component | Prefill (seq=2048) | Decode (seq=1) |
+|-----------|--------------------|----------------|
+| Weights (Q4_0) | 3.5 GB | 3.5 GB |
+| KV Cache | 2.0 GB | 2.0 GB |
+| Activations | 512 MB | 32 MB |
+| **Total** | **6.0 GB** | **5.5 GB** |
+
+### Compact Decode Layout
+
+**Prefill:** Activations use full stride layout `[hidden, max_seq]`
+```
+x[h, seq] at offset: h * max_seq + seq
+Total size: hidden * max_seq * sizeof(f16)
+```
+
+**Decode (seq=1):** Activations use stride=1 layout `[hidden, 1]`
+```
+x[h, 0] at offset: h
+Total size: hidden * sizeof(f16)
+```
+
+Reduction factor: `max_seq` (e.g., 4096× smaller for long-context models).
+
+---
+
+## Memory Pressure Detection
+
+### Compile-Time Check
+
+```rust
+pub fn validate_memory_budget(
+    plan: &MemoryPlan,
+    target: &MetalTarget,
+) -> anyhow::Result<()> {
+    let required_gb = (plan.total_activation_bytes + 
+                       plan.total_kv_cache_bytes + 
+                       plan.total_weight_bytes) as f64 / 1e9;
+    
+    let available_gb = target.unified_memory_gb as f64 * 0.8; // 80% usable
+    
+    if required_gb > available_gb {
+        anyhow::bail!(
+            "Insufficient memory: model requires {:.1} GB, device has {:.1} GB available",
+            required_gb, available_gb
+        );
+    }
+    
+    Ok(())
+}
+```
+
+### Runtime Memory Allocation
+
+```objc
+// Generated in unc_init()
+unc_state->weight_buf = [device newBufferWithBytes:weight_data
+    length:weight_size
+    options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+
+unc_state->act_buf = [device newBufferWithLength:UNC_ACTIVATION_BYTES
+    options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+
+unc_state->decode_act_buf = [device newBufferWithLength:UNC_DECODE_ACT_BYTES
+    options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+
+unc_state->kv_buf = [device newBufferWithLength:UNC_KV_CACHE_BYTES
+    options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+
+for (int i = 0; i < UNC_NUM_DECODE_REGIONS; i++) {
+    unc_state->act_r[i] = [device newBufferWithLength:decode_region_sizes[i]
+        options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+}
+```
+
+**Allocation failure:** If `newBufferWithLength:` returns `nil`, the runtime logs an error and aborts.
+
+---
+
+## Inspecting Memory Plan
+
+Use `unc inspect` to view the memory plan:
+
+```bash
+unc inspect ./tinyllama.unc
+```
+
+**Output:**
+```
+Memory Plan:
+  Activation buffers: 12 (256 MB peak)
+    Buffer 0 [0-2]: x1, x3 (64 MB)
+    Buffer 1 [1-4]: x2, x6 (48 MB)
+    Buffer 2 [2-5]: q (32 MB)
+    Buffer 3 [3-5]: k (32 MB)
+    Buffer 4 [4-5]: v (32 MB)
+    ...
+  
+  Decode regions: 12 (32 MB total)
+    Region 0: x1, x3 (64 KB)
+    Region 1: x2, x6 (48 KB)
+    ...
+  
+  KV Cache: 2048 MB (32 layers × 64 MB)
+    Layer 0: K @ 0, V @ 33554432 (32 MB each)
+    Layer 1: K @ 67108864, V @ 100663296
+    ...
+  
+  Total memory budget:
+    Prefill: 6.0 GB (weights 3.5 GB + KV 2.0 GB + activations 0.5 GB)
+    Decode:  5.5 GB (weights 3.5 GB + KV 2.0 GB + activations 0.03 GB)
+```
+
+---
+
+## Advanced: Custom Memory Strategies
+
+### Reducing KV Cache Size
+
+For long-context models (e.g., 128K tokens), KV cache dominates memory:
+
+```
+max_seq = 131072
+kv_cache = 32 layers × 32 heads × 131072 × 128 × 2 = 32 GB (!)
+```
+
+**Solutions:**
+
+1. **Quantize KV cache to INT8:**
+   ```rust
+   let bytes_per_elem = 1usize; // INT8 instead of F16
+   // Reduces KV cache to 16 GB
+   ```
+
+2. **Sliding window attention:**
+   ```rust
+   let effective_max_seq = 8192; // Only cache last 8K tokens
+   // Reduces KV cache to 2 GB
+   ```
+
+3. **Paged attention:** Allocate KV cache in 256-token pages, grow dynamically.
+
+---
+
+## Next Steps
+
+- [Compiler Passes](/advanced/compiler-passes) — How memory planning fits in the pipeline
+- [Kernel Fusion](/advanced/kernel-fusion) — Reducing activation memory via fusion
+- [Metal Backend](/advanced/metal-backend) — Buffer binding in generated orchestrator

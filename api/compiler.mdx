@@ -1,0 +1,418 @@
+---
+title: 'Compiler Module'
+description: 'Optimization passes, kernel matching, and memory planning'
+---
+
+The compiler module transforms raw computation graphs into optimized, executable forms through a pipeline of optimization passes.
+
+## Overview
+
+The compiler provides:
+- `PassPipeline` - Configurable optimization pipeline
+- `CompilationResult` - Optimized graph with memory plan and statistics
+- Optimization passes (DCE, fusion, kernel matching, memory planning)
+- Memory allocation with lifetime-based aliasing
+
+## PassPipeline
+
+Configures and executes the optimization pipeline.
+
+```rust
+pub struct PassPipeline {
+    pub passes: Vec<PassKind>,
+}
+```
+
+### Default Pipeline
+
+The standard optimization pipeline:
+
+1. **WeightBindingResolution** - Resolves weight tensor offsets in safetensors files
+2. **DeadCodeElimination** - Removes unused operations
+3. **QKVFusion** - Fuses Q/K/V projections into single kernel
+4. **ElementwiseFusion** - Fuses elementwise operations
+5. **AttentionFusion** - Optimizes attention patterns
+6. **DeadCodeElimination** - Second pass after fusion
+7. **DualPathInsertion** - Inserts prefill/decode branches
+8. **KernelMatching** - Assigns kernels to operations
+9. **LayoutOptimization** - Optimizes tensor layouts
+10. **MemoryPlanning** - Allocates buffers with aliasing
+11. **Scheduling** - Orders operations (already topological)
+
+### Constructor
+
+<ParamField path="PassPipeline::default()" type="Self">
+  Creates the standard optimization pipeline.
+</ParamField>
+
+### Methods
+
+<ParamField path="run(graph, registry, target, weight_files)" type="Result<CompilationResult>">
+  Executes the pipeline on a computation graph.
+  
+  **Parameters:**
+  - `graph: CompGraph` - Input computation graph from frontend
+  - `registry: &KernelRegistry` - Available kernels for target
+  - `target: &Target` - Target platform (Metal, CUDA, etc.)
+  - `weight_files: &[WeightFile]` - Safetensors files for weight binding
+  
+  **Returns:** `CompilationResult` with optimized graph and memory plan
+</ParamField>
+
+### Usage Example
+
+```rust src/main.rs
+use unc::compile::PassPipeline;
+use unc::kernel::registry::KernelRegistry;
+use unc::kernel::metal_mlx::register_metal_mlx_kernels;
+use unc::target::Target;
+
+// Build kernel registry
+let mut registry = KernelRegistry::new();
+register_metal_mlx_kernels(&mut registry, &metal_target);
+
+// Run compilation
+let pipeline = PassPipeline::default();
+let result = pipeline.run(
+    graph,
+    &registry,
+    &target,
+    &model_files.weight_files,
+)?;
+
+println!("Compiled {} nodes → {} nodes",
+    result.stats.nodes_before,
+    result.stats.nodes_after,
+);
+println!("Unique kernels: {}", result.stats.unique_kernels);
+println!("Activation memory: {} MB",
+    result.memory_plan.total_activation_bytes / (1024 * 1024),
+);
+```
+
+## CompilationResult
+
+Contains the optimized graph and compilation statistics.
+
+```rust
+pub struct CompilationResult {
+    pub graph: CompGraph,
+    pub memory_plan: MemoryPlan,
+    pub target: Target,
+    pub stats: CompilationStats,
+}
+```
+
+### Fields
+
+<ResponseField name="graph" type="CompGraph">
+  Optimized computation graph with:
+  - Resolved weight offsets
+  - Fused operations
+  - Assigned kernels
+  - Allocated activation buffers
+</ResponseField>
+
+<ResponseField name="memory_plan" type="MemoryPlan">
+  Static memory allocation plan:
+  - `activation_buffers: Vec<BufferAllocation>` - Aliased activation buffers
+  - `kv_cache: KVCacheLayout` - KV cache layout per layer
+  - `total_activation_bytes: usize` - Total activation memory
+  - `total_kv_cache_bytes: usize` - Total KV cache memory
+  - `decode_regions: Vec<DecodeRegion>` - Separate buffers for decode concurrency
+</ResponseField>
+
+<ResponseField name="target" type="Target">
+  Target platform (Metal, CUDA, etc.).
+</ResponseField>
+
+<ResponseField name="stats" type="CompilationStats">
+  Compilation statistics and metrics.
+</ResponseField>
+
+## CompilationStats
+
+Tracks optimization results and performance estimates.
+
+```rust
+pub struct CompilationStats {
+    pub nodes_before: usize,
+    pub nodes_after: usize,
+    pub unique_kernels: usize,
+    pub fusions_applied: usize,
+    pub estimated_flops_per_token: f64,
+    pub peak_activation_bytes: usize,
+    pub kernel_launches_per_forward: usize,
+}
+```
+
+### Fields
+
+<ResponseField name="nodes_before" type="usize">
+  Number of operations before optimization.
+</ResponseField>
+
+<ResponseField name="nodes_after" type="usize">
+  Number of operations after fusion and DCE.
+</ResponseField>
+
+<ResponseField name="unique_kernels" type="usize">
+  Number of distinct kernels used in the graph.
+</ResponseField>
+
+<ResponseField name="fusions_applied" type="usize">
+  Total number of fusion optimizations applied.
+</ResponseField>
+
+<ResponseField name="estimated_flops_per_token" type="f64">
+  Estimated FLOPs for one token generation.
+</ResponseField>
+
+<ResponseField name="peak_activation_bytes" type="usize">
+  Peak activation memory usage (with aliasing).
+</ResponseField>
+
+<ResponseField name="kernel_launches_per_forward" type="usize">
+  Number of kernel dispatches in one forward pass.
+</ResponseField>
+
+## MemoryPlan
+
+Static memory allocation with lifetime-based buffer aliasing.
+
+```rust
+pub struct MemoryPlan {
+    pub activation_buffers: Vec<BufferAllocation>,
+    pub kv_cache: KVCacheLayout,
+    pub total_activation_bytes: usize,
+    pub total_kv_cache_bytes: usize,
+    pub decode_regions: Vec<DecodeRegion>,
+}
+```
+
+### BufferAllocation
+
+A single activation buffer that may alias multiple tensors.
+
+```rust
+pub struct BufferAllocation {
+    pub id: BufferId,
+    pub size_bytes: usize,
+    pub offset: usize,
+    pub aliases: Vec<TensorId>,       // Tensors sharing this buffer
+    pub lifetime: BufferLifetime,
+}
+
+pub struct BufferLifetime {
+    pub first_write: usize,    // Node index of first write
+    pub last_read: usize,      // Node index of last read
+}
+```
+
+**Aliasing:** Buffers can be reused for multiple tensors if their lifetimes don't overlap. This reduces peak memory by ~40% for typical models.
+
+### KVCacheLayout
+
+Layout for key-value cache storage.
+
+```rust
+pub struct KVCacheLayout {
+    pub layers: Vec<KVCacheLayerLayout>,
+    pub total_bytes: usize,
+}
+
+pub struct KVCacheLayerLayout {
+    pub layer_idx: usize,
+    pub key_offset: usize,
+    pub key_size_bytes: usize,
+    pub value_offset: usize,
+    pub value_size_bytes: usize,
+    pub dtype: DType,
+}
+```
+
+### DecodeRegion
+
+Separate buffer for decode-time concurrent dispatch.
+
+```rust
+pub struct DecodeRegion {
+    pub region_id: u32,
+    pub size_bytes: usize,     // Size for seq_len=1
+    pub tensors: Vec<TensorId>,
+}
+```
+
+**Decode optimization:** At decode time (seq_len=1), activation buffers are ~1/8192 smaller. Split regions enable concurrent kernel dispatch without hazard tracking.
+
+### Memory Plan Example
+
+```rust
+use unc::compile::memory::plan_memory;
+
+let memory_plan = plan_memory(&graph);
+
+println!("Activation memory: {:.1} MB (prefill)",
+    memory_plan.total_activation_bytes as f64 / (1024.0 * 1024.0),
+);
+println!("KV cache: {:.1} MB (max_seq_len={})",
+    memory_plan.total_kv_cache_bytes as f64 / (1024.0 * 1024.0),
+    graph.metadata.params.max_position_embeddings,
+);
+println!("Aliasing: {} buffers for {} activation tensors",
+    memory_plan.activation_buffers.len(),
+    memory_plan.activation_buffers.iter()
+        .map(|b| b.aliases.len())
+        .sum::<usize>(),
+);
+```
+
+## Optimization Passes
+
+### Weight Binding Resolution
+
+Resolves tensor byte offsets in safetensors files.
+
+```rust
+use unc::compile::passes::weight_binding::resolve_weight_bindings;
+
+resolve_weight_bindings(&mut graph, weight_files)?;
+```
+
+**Effect:** Fills in `WeightBinding::byte_offset` and `byte_size` for all weight tensors by reading safetensors headers.
+
+### Dead Code Elimination
+
+Removes unreachable operations.
+
+```rust
+use unc::compile::passes::dce::eliminate_dead_code;
+
+eliminate_dead_code(&mut graph);
+```
+
+**Effect:** Deletes nodes that don't contribute to graph outputs. Typically removes 5-10% of nodes.
+
+### QKV Fusion
+
+Fuses Q/K/V projection MatMuls into a single kernel.
+
+```rust
+use unc::compile::passes::qkv_fusion::fuse_qkv;
+
+let num_fusions = fuse_qkv(&mut graph);
+println!("Applied {} QKV fusions", num_fusions);
+```
+
+**Effect:** Replaces 3 MatMul nodes with 1 `Fused(QKVProjection)` node. Reduces kernel launches by 2×num_layers.
+
+### Elementwise Fusion
+
+Fuses chains of elementwise operations.
+
+```rust
+use unc::compile::passes::elementwise_fusion::fuse_elementwise;
+
+let num_fusions = fuse_elementwise(&mut graph);
+```
+
+**Effect:** Fuses Add+RMSNorm, SiLU+Mul (SwiGLU), etc. Reduces memory traffic and kernel launches.
+
+### Dual Path Insertion
+
+Inserts prefill/decode branches for MatMul operations.
+
+```rust
+use unc::compile::passes::dual_path::insert_dual_paths;
+
+insert_dual_paths(&mut graph, registry, target);
+```
+
+**Effect:** Replaces MatMul with dual-path nodes that select GEMM (prefill) or GEMV (decode) at runtime.
+
+### Kernel Matching
+
+Assigns kernels from the registry to each operation.
+
+```rust
+use unc::compile::passes::kernel_matching::match_kernels;
+
+let num_kernels = match_kernels(&mut graph, registry, target)?;
+println!("Matched {} unique kernels", num_kernels);
+```
+
+**Effect:** Fills `Node::kernel` with `KernelAssignment` including kernel ID, dispatch config, and execution path.
+
+## Complete Compilation Example
+
+```rust src/compile_example.rs
+use unc::compile::{PassPipeline, CompilationResult};
+use unc::frontend::{
+    huggingface::ModelLoader,
+    config::parse_config,
+    templates::llama::lower_llama,
+};
+use unc::kernel::registry::KernelRegistry;
+use unc::kernel::metal_mlx::register_metal_mlx_kernels;
+use unc::target::Target;
+
+// 1. Load model
+let loader = ModelLoader::new()?;
+let files = loader.load("meta-llama/Llama-3.2-1B")?;
+let (arch, params, bos, eos) = parse_config(&files.config_json)?;
+
+// 2. Build graph
+let graph = lower_llama(
+    &params,
+    &files.weight_files,
+    &files.model_id,
+    files.tokenizer_json.as_deref().map(|p| p.to_str().unwrap()),
+    bos,
+    eos,
+);
+println!("Initial graph: {} nodes", graph.num_nodes());
+
+// 3. Build kernel registry
+let target = Target::Metal(detect_metal_target()?);
+let mut registry = KernelRegistry::new();
+register_metal_mlx_kernels(&mut registry, &target.as_metal().unwrap());
+
+// 4. Compile
+let pipeline = PassPipeline::default();
+let result = pipeline.run(graph, &registry, &target, &files.weight_files)?;
+
+println!("\nCompilation Results:");
+println!("  Nodes: {} → {}", result.stats.nodes_before, result.stats.nodes_after);
+println!("  Fusions: {}", result.stats.fusions_applied);
+println!("  Kernels: {}", result.stats.unique_kernels);
+println!("  Kernel launches: {}", result.stats.kernel_launches_per_forward);
+println!("\nMemory:");
+println!("  Weights: {:.1} MB",
+    result.graph.metadata.total_weight_bytes as f64 / (1024.0 * 1024.0));
+println!("  Activations: {:.1} MB",
+    result.memory_plan.total_activation_bytes as f64 / (1024.0 * 1024.0));
+println!("  KV cache: {:.1} MB",
+    result.memory_plan.total_kv_cache_bytes as f64 / (1024.0 * 1024.0));
+```
+
+**Typical output for Llama-3.2-1B:**
+```
+Initial graph: 312 nodes
+
+Compilation Results:
+  Nodes: 312 → 156
+  Fusions: 32
+  Kernels: 24
+  Kernel launches: 156
+
+Memory:
+  Weights: 2488.3 MB
+  Activations: 128.0 MB
+  KV cache: 256.0 MB
+```
+
+## Related
+
+- [IR Module](/api/ir) - Computation graph representation
+- [Kernel Module](/api/kernel) - Kernel registry and matching
+- [Emit Module](/api/emit) - Code generation

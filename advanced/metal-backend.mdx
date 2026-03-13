@@ -1,0 +1,681 @@
+---
+title: Metal Backend Implementation
+description: How UNC generates Metal kernels and orchestrator code for Apple Silicon
+---
+
+# Metal Backend Implementation
+
+UNC's Metal backend compiles models to native Apple Silicon code using Metal Shading Language (MSL) kernels and an Objective-C orchestrator.
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Compilation Result                      │
+│  (Optimized IR graph + memory plan + kernel assignments)    │
+└─────────────────────────────────────────────────────────────┘
+                             │
+                             ↓
+                 ┌───────────────────────┐
+                 │   emit_metal()        │
+                 │   src/emit/metal.rs   │
+                 └───────────────────────┘
+                             │
+                ┌────────────┴────────────┐
+                ↓                         ↓
+    ┌──────────────────────┐   ┌─────────────────────┐
+    │  unc_kernels.metallib│   │  unc_forward.m      │
+    │  (compiled MSL)      │   │  (orchestrator)     │
+    └──────────────────────┘   └─────────────────────┘
+                │                         │
+                └────────────┬────────────┘
+                             ↓
+                    ┌─────────────────┐
+                    │  .unc bundle    │
+                    │  or Mach-O AOT  │
+                    └─────────────────┘
+```
+
+---
+
+## Kernel Sources Structure
+
+### Directory Layout
+
+```
+kernel_sources/metal/
+├── unc_kernels/
+│   ├── unc_kernels.metal       # Custom UNC kernels
+│   └── mlx_kernels.metal        # Kernels from MLX upstream
+└── upstream_mlx/
+    ├── bf16.h
+    ├── quantized.h
+    ├── quantized.metal
+    ├── gemv.metal
+    ├── layer_norm.metal
+    └── ...
+```
+
+### Custom vs Upstream Kernels
+
+**UNC Custom Kernels** (`unc_kernels.metal`):
+- Fused kernels (QKV, Gate+Up+SwiGLU, Add+RMSNorm)
+- RoPE+KV+SDPA super-fusion
+- PSQ pipeline kernels
+- Optimized GEMV with separated scale/data layout
+
+**MLX Upstream Kernels** (`upstream_mlx/`):
+- Base GEMM/GEMV implementations
+- Standard quantization (Q4_0, Q8_0)
+- Elementwise ops (RMSNorm, Softmax, GELU)
+- FlashAttention (steel_attn)
+
+---
+
+## Kernel Registry and Matching
+
+### Registration
+
+Kernels are registered with constraints and performance models:
+
+```rust
+// src/kernel/metal_mlx.rs
+pub fn register_metal_mlx_kernels(
+    registry: &mut KernelRegistry,
+    target: &MetalTarget,
+) {
+    let (tile_m, tile_n, tile_k) = target.gpu_family.preferred_gemm_tile_f16();
+    
+    // GEMM (prefill path)
+    registry.register(KernelEntry {
+        id: Default::default(),
+        name: format!("steel_gemm_f16_{}x{}x{}", tile_m, tile_n, tile_k),
+        op_pattern: OpPattern::GEMM { tile_m, tile_n, tile_k },
+        input_constraints: vec![
+            TensorConstraint::any(vec![DType::F16]),
+            TensorConstraint::any(vec![DType::F16]),
+        ],
+        output_dtype: DType::F16,
+        target: t.clone(),
+        source: KernelSource::MLX {
+            file: "steel/gemm/kernels/steel_gemm.metal".to_string(),
+            variant: format!("steel_gemm_f16_{tile_m}x{tile_n}x{tile_k}"),
+        },
+        dispatch_template: DispatchTemplate {
+            threadgroup: [tile_m, 1, 1],
+            grid_rules: [
+                GridRule::CeilDivOutputDim { axis: 0, tile_size: tile_m },
+                GridRule::CeilDivOutputDim { axis: 1, tile_size: tile_n },
+                GridRule::Constant(1),
+            ],
+            shared_memory_bytes: tile_m * tile_k * 2 + tile_k * tile_n * 2,
+        },
+        perf_model: PerfModel::ComputeBound { utilization: 0.65 },
+    });
+}
+```
+
+### Kernel Matching
+
+The compiler selects kernels based on:
+1. **Op pattern:** Does the kernel support this operation?
+2. **Tensor constraints:** Do input/output dtypes match?
+3. **Target capabilities:** Is this kernel available on the GPU family?
+4. **Performance model:** Which kernel has best estimated performance?
+
+See [Compiler Passes: Kernel Matching](/advanced/compiler-passes#kernel-matching-pass) for details.
+
+---
+
+## JIT Compilation via Clang
+
+### Bundle Format (`.unc`)
+
+JIT bundles contain:
+```
+.unc/
+├── unc_kernels.metallib    # Pre-compiled Metal library
+├── unc_forward.m           # Generated orchestrator source
+├── weights.safetensors     # Model weights (or symlink)
+└── metadata.json           # Model config
+```
+
+### Runtime Compilation
+
+On first run, the orchestrator is compiled:
+
+```rust
+// src/runtime/jit.rs
+pub fn compile_orchestrator(bundle_path: &Path) -> anyhow::Result<PathBuf> {
+    let src_path = bundle_path.join("unc_forward.m");
+    let obj_path = bundle_path.join("unc_forward.o");
+    let bin_path = bundle_path.join("unc_forward");
+    
+    // Compile
+    let status = Command::new("clang")
+        .args([
+            "-c", "-fobjc-arc", "-O2",
+            src_path.to_str().unwrap(),
+            "-o", obj_path.to_str().unwrap(),
+        ])
+        .status()?;
+    
+    if !status.success() {
+        anyhow::bail!("clang compile failed");
+    }
+    
+    // Link
+    let status = Command::new("clang")
+        .args([
+            obj_path.to_str().unwrap(),
+            "-framework", "Metal",
+            "-framework", "Foundation",
+            "-o", bin_path.to_str().unwrap(),
+        ])
+        .status()?;
+    
+    if !status.success() {
+        anyhow::bail!("clang link failed");
+    }
+    
+    Ok(bin_path)
+}
+```
+
+**Caching:** Compiled binary is cached in the bundle. Subsequent runs skip compilation.
+
+---
+
+## AOT Binary Emission (Mach-O)
+
+### Binary Layout
+
+```
+┌────────────────────────────────────────────────────┐
+│  Mach-O Executable Header                          │
+├────────────────────────────────────────────────────┤
+│  Code Segment                                      │
+│  - main()                                          │
+│  - unc_init()                                      │
+│  - unc_forward()                                   │
+│  - Embedded metallib (byte array)                 │
+│  - Embedded tokenizer (vocab + merges)            │
+├────────────────────────────────────────────────────┤
+│  Padding to 16KB page boundary                     │
+├────────────────────────────────────────────────────┤
+│  Model Weights (appended, mmap-friendly)          │
+│  [3.5 GB of safetensors data]                      │
+├────────────────────────────────────────────────────┤
+│  Trailer (24 bytes):                               │
+│    - weight_offset (u64)                           │
+│    - weight_size (u64)                             │
+│    - magic "UNCW8TSX" (8 bytes)                   │
+└────────────────────────────────────────────────────┘
+```
+
+### Self-mmap for Weights
+
+The binary mmaps itself to access weights:
+
+```objc
+// Generated in unc_main.m (AOT mode)
+static void* load_appended_weights(size_t* out_size) {
+    // Get path to self
+    char self_path[4096];
+    uint32_t path_len = sizeof(self_path);
+    _NSGetExecutablePath(self_path, &path_len);
+    
+    int fd = open(self_path, O_RDONLY);
+    struct stat st;
+    fstat(fd, &st);
+    off_t file_size = st.st_size;
+    
+    // Read trailer
+    uint8_t trailer[24];
+    pread(fd, trailer, 24, file_size - 24);
+    
+    // Verify magic
+    if (memcmp(trailer + 16, "UNCW8TSX", 8) != 0) {
+        fprintf(stderr, "Error: no UNC weight trailer\n");
+        return NULL;
+    }
+    
+    uint64_t weight_offset, weight_size;
+    memcpy(&weight_offset, trailer, 8);
+    memcpy(&weight_size, trailer + 8, 8);
+    
+    // mmap weights
+    void* mapped = mmap(NULL, (size_t)weight_size, PROT_READ, 
+                        MAP_PRIVATE, fd, (off_t)weight_offset);
+    close(fd);
+    
+    *out_size = (size_t)weight_size;
+    return mapped;
+}
+```
+
+**Benefits:**
+- Zero-copy weight loading
+- No external files needed
+- Weights stay on disk until accessed (virtual memory paging)
+
+---
+
+## Target Detection for Apple Silicon
+
+### GPU Family Detection
+
+```rust
+// src/target/detect.rs
+pub fn detect_metal_target() -> anyhow::Result<MetalTarget> {
+    use metal::Device;
+    
+    let device = Device::system_default()
+        .ok_or_else(|| anyhow::anyhow!("No Metal device found"))?;
+    
+    let name = device.name().to_lowercase();
+    
+    let gpu_family = if name.contains("m4") || name.contains("apple10") {
+        AppleGPUFamily::Apple10
+    } else if name.contains("m3") || name.contains("apple9") {
+        AppleGPUFamily::Apple9
+    } else if name.contains("m2") || name.contains("apple8") {
+        AppleGPUFamily::Apple8
+    } else {
+        AppleGPUFamily::Apple7  // M1 or unknown
+    };
+    
+    let unified_memory_gb = get_unified_memory_gb().unwrap_or(8);
+    
+    // Bandwidth estimates (GB/s)
+    let memory_bandwidth_gbps = match gpu_family {
+        AppleGPUFamily::Apple7 => 68,   // M1
+        AppleGPUFamily::Apple8 => 100,  // M2
+        AppleGPUFamily::Apple9 => 150,  // M3
+        AppleGPUFamily::Apple10 => 120, // M4
+    };
+    
+    Ok(MetalTarget { gpu_family, unified_memory_gb, memory_bandwidth_gbps })
+}
+```
+
+### Family-Specific Optimizations
+
+```rust
+impl AppleGPUFamily {
+    pub fn preferred_gemm_tile_f16(&self) -> (u32, u32, u32) {
+        match self {
+            AppleGPUFamily::Apple7 | AppleGPUFamily::Apple8 => {
+                (32, 32, 16)  // M1/M2: smaller tiles
+            }
+            AppleGPUFamily::Apple9 | AppleGPUFamily::Apple10 => {
+                (64, 64, 32)  // M3/M4: larger tiles, more registers
+            }
+        }
+    }
+    
+    pub fn supports_bf16(&self) -> bool {
+        *self >= AppleGPUFamily::Apple9  // M3+ has hardware BF16
+    }
+}
+```
+
+**Impact:** M3 uses 4× larger GEMM tiles (64×64 vs 32×32), improving compute utilization.
+
+---
+
+## Orchestrator Code Generation
+
+### Structure
+
+The generated `unc_forward.m` contains:
+
+```objc
+// 1. Constants
+#define UNC_NUM_LAYERS       32
+#define UNC_HIDDEN_SIZE      4096
+#define UNC_NUM_HEADS        32
+#define UNC_HEAD_DIM         128
+#define UNC_ACTIVATION_BYTES 268435456  // 256 MB
+#define UNC_KV_CACHE_BYTES   2147483648 // 2 GB
+
+// 2. Pipeline state
+typedef struct {
+    id<MTLDevice>      device;
+    id<MTLCommandQueue> queue;
+    id<MTLLibrary>     library;
+    id<MTLBuffer>      weight_buf;
+    id<MTLBuffer>      act_buf;
+    id<MTLBuffer>      kv_buf;
+    id<MTLBuffer>      act_r[12];  // Decode regions
+    // ... PSO cache, etc.
+} UNCState;
+
+// 3. Initialization
+void unc_init(const char* metallib_path, void* weight_data, size_t weight_size) {
+    // Allocate buffers, load metallib, pre-warm PSOs
+}
+
+// 4. Forward pass
+void unc_forward(
+    const uint32_t* token_ids,
+    uint32_t        seq_len,
+    uint32_t        total_seq_len,
+    float*          out_logits
+) {
+    // Dispatch kernels
+}
+```
+
+### Dispatch Code Generation
+
+For each node in the graph:
+
+```rust
+// src/emit/metal.rs (simplified)
+fn emit_dispatch(
+    node: &Node,
+    graph: &CompGraph,
+    memory_plan: &MemoryPlan,
+) -> String {
+    let ka = node.kernel.as_ref().unwrap();
+    
+    // Resolve buffer offsets
+    let input_offsets: Vec<usize> = node.inputs.iter()
+        .map(|tid| activation_offset(tid, memory_plan))
+        .collect();
+    let output_offset = activation_offset(&node.output, memory_plan);
+    
+    // Generate dual-path dispatch for GEMM ops
+    if let ExecutionPath::Dual { prefill_kernel_name, decode_kernel_name, .. } = &ka.path {
+        format!(r#"
+    if (seq_len > 1) {{
+        // Prefill path: GEMM
+        id<MTLComputePipelineState> pso = pso_{prefill_kernel_name};
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:s->act_buf offset:{output_offset} atIndex:0];
+        [enc setBuffer:s->act_buf offset:{} atIndex:1];
+        [enc setBuffer:s->weight_buf offset:{} atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake({}, {}, {}) 
+             threadsPerThreadgroup:MTLSizeMake({}, {}, {})];
+    }} else {{
+        // Decode path: GEMV
+        id<MTLComputePipelineState> pso = pso_{decode_kernel_name};
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:s->decode_act_buf offset:{} atIndex:0];
+        [enc setBuffer:s->decode_act_buf offset:{} atIndex:1];
+        [enc setBuffer:s->quant_weight_buf offset:{} atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake({}, 1, 1) 
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }}
+"#, 
+            input_offsets[0], weight_offset(node.inputs[1]),
+            prefill_grid_x, prefill_grid_y, prefill_grid_z,
+            prefill_tg_x, prefill_tg_y, prefill_tg_z,
+            decode_output_offset, decode_input_offset, decode_weight_offset,
+            decode_grid_x
+        )
+    } else {
+        // Unified path (elementwise, normalization, etc.)
+        // ...
+    }
+}
+```
+
+### Barrier Emission
+
+From barrier analysis:
+
+```rust
+if barrier_plan.barrier_before.contains(&dispatch_idx) {
+    if let Some(regions) = barrier_plan.barrier_regions.get(&dispatch_idx) {
+        // Selective per-resource barrier
+        let region_refs: Vec<String> = regions.iter()
+            .map(|&r| format!("s->act_r[{}]", r))
+            .collect();
+        src.push_str(&format!(r#"
+    if (seq_len == 1) {{
+        [enc memoryBarrierWithResources:@[{}]
+            afterStages:MTLBarrierStageFragment
+            beforeStages:MTLBarrierStageVertex];
+    }}
+"#, region_refs.join(", ")));
+    } else {
+        // Full-scope barrier
+        src.push_str("    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];\n");
+    }
+}
+```
+
+---
+
+## Kernel Examples
+
+### 1. GEMV (Decode Path)
+
+```metal
+// upstream_mlx/gemv.metal
+kernel void gemv_f16(
+    device half*       y,         // Output [M]
+    device const half* A,         // Matrix [M, K]
+    device const half* x,         // Vector [K]
+    constant uint&     M,
+    constant uint&     K,
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= M) return;
+    
+    // Each thread computes one output element: y[gid] = A[gid, :] · x
+    float sum = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        sum += float(A[gid * K + k]) * float(x[k]);
+    }
+    y[gid] = half(sum);
+}
+```
+
+**Dispatch:** `(ceil(M / 16), 1, 1)` threadgroups × `(256, 1, 1)` threads
+
+### 2. Quantized GEMV (Q4_0)
+
+```metal
+// unc_kernels/unc_kernels.metal
+kernel void qmv_fast_q4_0(
+    device half*        y,          // [M]
+    device const half*  x,          // [K]
+    device const half*  scales,     // [M, K/32] — separated scale buffer
+    device const uchar* data,       // [M, K/2] — packed 4-bit data
+    constant uint&      M,
+    constant uint&      K,
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= M) return;
+    
+    uint num_blocks = K / 32;  // Q4_0 block size = 32
+    float sum = 0.0f;
+    
+    for (uint block = 0; block < num_blocks; block++) {
+        float scale = float(scales[gid * num_blocks + block]);
+        
+        // Process 32 elements in this block
+        for (uint i = 0; i < 32; i++) {
+            // Unpack 4-bit weight (stored as nibbles)
+            uint byte_idx = (gid * K + block * 32 + i) / 2;
+            uchar packed = data[byte_idx];
+            int nibble = (i & 1) ? (packed >> 4) : (packed & 0xF);
+            
+            // Dequantize: weight = (nibble - 8) * scale
+            float weight = (float(nibble) - 8.0f) * scale;
+            
+            sum += weight * float(x[block * 32 + i]);
+        }
+    }
+    
+    y[gid] = half(sum);
+}
+```
+
+### 3. RMSNorm
+
+```metal
+// unc_kernels/unc_kernels.metal
+kernel void rms_norm_f16(
+    device half*       out,
+    device const half* x,
+    device const half* weight,
+    constant uint&     seq_len,
+    constant uint&     hidden,
+    constant float&    eps,
+    uint tgid [[threadgroup_position_in_grid]],   // Token index
+    uint tid  [[thread_position_in_threadgroup]], // 0..255
+    threadgroup float* shared [[threadgroup(0)]])
+{
+    uint si = tgid;
+    if (si >= seq_len) return;
+    
+    // Phase 1: Each thread computes partial sum-of-squares
+    float local_sum_sq = 0.0f;
+    for (uint h = tid; h < hidden; h += 256) {
+        float x_val = float(x[h * seq_len + si]);
+        local_sum_sq += x_val * x_val;
+    }
+    
+    // Phase 2: Parallel reduction in threadgroup memory
+    shared[tid] = local_sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    // Phase 3: Normalize (all threads use shared[0])
+    float rms = sqrt(shared[0] / float(hidden) + eps);
+    
+    for (uint h = tid; h < hidden; h += 256) {
+        float x_val = float(x[h * seq_len + si]);
+        out[h * seq_len + si] = half((x_val / rms) * float(weight[h]));
+    }
+}
+```
+
+**Shared memory usage:** 256 floats × 4 bytes = 1024 bytes
+
+### 4. Fused QKV GEMV
+
+```metal
+// unc_kernels/unc_kernels.metal (simplified)
+kernel void fused_qkv_qmv_fast_q4_0(
+    device half*        q_out,
+    device half*        k_out,
+    device half*        v_out,
+    device const half*  x,
+    device const half*  wq_scales,
+    device const uchar* wq_data,
+    device const half*  wk_scales,
+    device const uchar* wk_data,
+    device const half*  wv_scales,
+    device const uchar* wv_data,
+    constant uint&      hidden,
+    uint row [[thread_position_in_grid]])
+{
+    uint num_blocks = hidden / 32;
+    float sum_q = 0.0f, sum_k = 0.0f, sum_v = 0.0f;
+    
+    for (uint block = 0; block < num_blocks; block++) {
+        // Load activation block once
+        half x_block[32];
+        for (uint i = 0; i < 32; i++) {
+            x_block[i] = x[block * 32 + i];
+        }
+        
+        // Q projection
+        float q_scale = float(wq_scales[row * num_blocks + block]);
+        for (uint i = 0; i < 32; i++) {
+            uchar packed = wq_data[(row * hidden + block * 32 + i) / 2];
+            int nibble = (i & 1) ? (packed >> 4) : (packed & 0xF);
+            float wq = (float(nibble) - 8.0f) * q_scale;
+            sum_q += float(x_block[i]) * wq;
+        }
+        
+        // K projection (same logic)
+        // ...
+        
+        // V projection
+        // ...
+    }
+    
+    q_out[row] = half(sum_q);
+    k_out[row] = half(sum_k);
+    v_out[row] = half(sum_v);
+}
+```
+
+**Key optimization:** `x_block` is loaded once and reused for Q, K, V.
+
+---
+
+## Performance Profiling
+
+### Xcode Instruments
+
+1. Compile model:
+   ```bash
+   unc compile --model meta-llama/Llama-2-7b-hf --quant q4-0 -o llama2
+   ```
+
+2. Run with Metal capture:
+   ```bash
+   METAL_CAPTURE_ENABLED=1 unc run llama2.unc --prompt "Hello" --max-tokens 100
+   ```
+
+3. Open capture in Xcode Instruments → GPU Trace
+
+**Metrics to inspect:**
+- Kernel execution time per dispatch
+- Memory bandwidth utilization
+- ALU utilization (compute-bound kernels)
+- Barrier overhead
+
+### Built-in Profiling
+
+The orchestrator includes timing:
+
+```objc
+void unc_forward(...) {
+    struct timespec ts_start, ts_end;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts_start);
+    
+    id<MTLCommandBuffer> cmd = [s->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    
+    // ... dispatch all kernels ...
+    
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts_end);
+    double elapsed = (ts_end.tv_sec - ts_start.tv_sec) + 
+                     (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+    
+    if (seq_len == 1) {
+        // Decode timing
+        _decode_count++;
+        _decode_total += elapsed;
+        double tok_per_sec = 1.0 / elapsed;
+        fprintf(stderr, "[decode %llu] %.2f ms (%.1f tok/s)\n", 
+                _decode_count, elapsed * 1000, tok_per_sec);
+    }
+}
+```
+
+---
+
+## Next Steps
+
+- [Compiler Passes](/advanced/compiler-passes) — How the IR graph becomes Metal code
+- [Kernel Fusion](/advanced/kernel-fusion) — Performance impact of fusion
+- [Memory Planning](/advanced/memory-planning) — Buffer allocation strategy

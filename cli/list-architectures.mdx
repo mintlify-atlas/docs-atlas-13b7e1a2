@@ -1,0 +1,162 @@
+---
+title: 'unc list-architectures'
+description: 'List supported model architectures'
+---
+
+## Overview
+
+The `unc list-architectures` command displays all model architectures currently supported by the UNC compiler.
+
+## Command Signature
+
+```bash
+unc list-architectures
+```
+
+## Parameters
+
+This command takes no parameters.
+
+## Output
+
+The command prints a formatted table showing:
+- **HuggingFace model class** - The architecture identifier used in `config.json`
+- **Model families** - Specific model variants supported
+
+## Example Output
+
+```bash
+$ unc list-architectures
+Supported architectures:
+  LlamaForCausalLM               LLaMA, LLaMA-2, LLaMA-3
+  MistralForCausalLM             Mistral, Mixtral
+  Qwen2ForCausalLM               Qwen, Qwen-2
+  PhiForCausalLM                 Phi-2, Phi-3
+  GemmaForCausalLM               Gemma, Gemma-2
+```
+
+## Supported Architectures
+
+### LLaMA Family
+
+<ParamField path="LlamaForCausalLM" type="architecture">
+  **Models**: LLaMA, LLaMA-2, LLaMA-3
+  
+  Compatible with:
+  - `meta-llama/Llama-3.2-1B-Instruct`
+  - `meta-llama/Llama-3.2-3B-Instruct`
+  - `meta-llama/Llama-2-7b-chat-hf`
+  - `meta-llama/Meta-Llama-3-8B`
+  - And other LLaMA variants
+</ParamField>
+
+### Mistral Family
+
+<ParamField path="MistralForCausalLM" type="architecture">
+  **Models**: Mistral, Mixtral
+  
+  Compatible with:
+  - `mistralai/Mistral-7B-v0.1`
+  - `mistralai/Mistral-7B-Instruct-v0.2`
+  - `mistralai/Mixtral-8x7B-v0.1`
+  - And other Mistral variants
+</ParamField>
+
+### Qwen Family
+
+<ParamField path="Qwen2ForCausalLM" type="architecture">
+  **Models**: Qwen, Qwen-2
+  
+  Compatible with:
+  - `Qwen/Qwen2-1.5B-Instruct`
+  - `Qwen/Qwen2-7B`
+  - And other Qwen variants
+</ParamField>
+
+### Phi Family
+
+<ParamField path="PhiForCausalLM" type="architecture">
+  **Models**: Phi-2, Phi-3
+  
+  Compatible with:
+  - `microsoft/phi-2`
+  - `microsoft/phi-3-mini-4k-instruct`
+  - And other Phi variants
+</ParamField>
+
+### Gemma Family
+
+<ParamField path="GemmaForCausalLM" type="architecture">
+  **Models**: Gemma, Gemma-2
+  
+  Compatible with:
+  - `google/gemma-2b`
+  - `google/gemma-7b-it`
+  - And other Gemma variants
+</ParamField>
+
+## How Architecture Detection Works
+
+1. When you run `unc compile --model <MODEL_ID>`, UNC downloads the model's `config.json`
+2. The compiler reads the `architectures` field from `config.json`
+3. It matches the architecture class against the supported list
+4. The corresponding architecture template is used to build the computation graph
+
+### Example config.json
+
+```json
+{
+  "architectures": ["LlamaForCausalLM"],
+  "hidden_size": 2048,
+  "num_hidden_layers": 16,
+  "num_attention_heads": 32,
+  ...
+}
+```
+
+## Checking Model Compatibility
+
+Before compiling a model, you can:
+
+1. **Check the model card** on HuggingFace
+2. **Run this command** to see supported architectures
+3. **Look at the config.json** in the model repository
+
+### Example Workflow
+
+```bash
+# 1. List supported architectures
+unc list-architectures
+
+# 2. Check a model's architecture on HuggingFace
+curl -s https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/raw/main/config.json | grep architectures
+# Output: "architectures": ["LlamaForCausalLM"]
+
+# 3. Compile if supported
+unc compile --model meta-llama/Llama-3.2-1B-Instruct --output llama3.unc
+```
+
+## Unsupported Architectures
+
+If you try to compile a model with an unsupported architecture, you'll see an error during compilation:
+
+```bash
+$ unc compile --model gpt2 --output gpt2.unc
+Error: GPTNeoX not yet supported
+```
+
+## Roadmap
+
+Architectures under consideration for future support:
+- GPT-NeoX
+- Falcon
+- StableLM
+- MPT
+- BLOOM
+
+## Contributing
+
+To request support for a new architecture:
+1. Open an issue on the [UNC GitHub repository](https://github.com/unclecode/unc)
+2. Include the HuggingFace model ID and use case
+3. Link to the model's `config.json` and architecture details

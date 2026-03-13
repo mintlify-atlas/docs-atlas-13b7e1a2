@@ -1,0 +1,588 @@
+---
+title: Kernel Fusion Strategies
+description: How UNC fuses operations to reduce dispatch overhead and memory bandwidth
+---
+
+# Kernel Fusion Strategies
+
+Kernel fusion is one of UNC's primary optimization techniques, reducing both dispatch overhead and memory traffic by combining multiple operations into single GPU kernels.
+
+## Why Kernel Fusion Matters
+
+### Dispatch Overhead
+
+Every Metal kernel dispatch incurs:
+- **CPU overhead:** ~1-2 μs for encoder setup, argument binding, and dispatch
+- **GPU overhead:** Pipeline state switch, barrier synchronization
+- **Memory roundtrip:** Intermediate results written to and read from DRAM
+
+For small operations (elementwise, normalization), dispatch overhead dominates compute time.
+
+### Memory Bandwidth
+
+Transformer decode is memory-bound. Fusing ops reduces DRAM traffic:
+
+**Unfused:**
+```
+gate = SiLU(x)      // Read x (8KB), write gate (8KB)  → 16KB
+out = Mul(gate, up) // Read gate (8KB), up (8KB), write out (8KB) → 24KB
+Total: 40KB DRAM traffic
+```
+
+**Fused:**
+```
+out = SwiGLU(x, up) // Read x (8KB), up (8KB), write out (8KB) → 24KB
+Total: 24KB DRAM traffic (40% reduction)
+```
+
+---
+
+## Fusion Patterns
+
+UNC recognizes several fusion patterns defined in `src/ir/ops.rs:99-117`:
+
+```rust
+pub enum FusionPattern {
+    RMSNormLinear,
+    SwiGLU,
+    QKVProjection { q_size: usize, k_size: usize, v_size: usize },
+    LinearActivation { activation: ActivationType, has_bias: bool },
+    LinearResidualAdd,
+    Custom { name: String, ops: Vec<String> },
+}
+
+pub enum ActivationType {
+    SiLU,
+    GELU,
+    ReLU,
+    None,
+}
+```
+
+---
+
+## 1. QKV Projection Fusion
+
+### Pattern
+
+```
+q = MatMul(x, Wq)  // [hidden] × [hidden, q_size]
+k = MatMul(x, Wk)  // [hidden] × [hidden, k_size]  
+v = MatMul(x, Wv)  // [hidden] × [hidden, v_size]
+```
+
+### Fused Implementation (Decode Path)
+
+**Kernel:** `fused_qkv_qmv_fast_q4_0` (for Q4_0 quantization)
+
+```metal
+kernel void fused_qkv_qmv_fast_q4_0(
+    device half*        q_out,     // [num_heads * head_dim]
+    device half*        k_out,     // [num_kv_heads * head_dim]
+    device half*        v_out,     // [num_kv_heads * head_dim]
+    device const half*  x_in,      // [hidden] — activation
+    device const half*  wq_scales, // [q_rows] — quantized Q weight scales
+    device const uchar* wq_data,   // [q_rows * K/2] — quantized Q weight data
+    device const half*  wk_scales,
+    device const uchar* wk_data,
+    device const half*  wv_scales,
+    device const uchar* wv_data,
+    constant uint&      hidden,
+    uint row [[thread_position_in_grid]])
+{
+    // Load activation once into registers
+    float acc_q = 0, acc_k = 0, acc_v = 0;
+    
+    // Process K dimension in chunks (vectorized)
+    for (uint k = 0; k < hidden; k += 32) {
+        // Load x_in chunk (32 elements) — shared across Q/K/V
+        half x_chunk[32];
+        for (uint i = 0; i < 32; i++) {
+            x_chunk[i] = x_in[k + i];
+        }
+        
+        // Q projection: dequantize weight block, dot with x
+        uint q_block_idx = row * (hidden / 32) + (k / 32);
+        half q_scale = wq_scales[q_block_idx];
+        for (uint i = 0; i < 32; i++) {
+            // Unpack 4-bit weight
+            uchar packed = wq_data[q_block_idx * 16 + i/2];
+            int nibble = (i & 1) ? (packed >> 4) : (packed & 0xF);
+            float wq_val = (float(nibble) - 8.0f) * float(q_scale);
+            acc_q += float(x_chunk[i]) * wq_val;
+        }
+        
+        // K projection (same logic)
+        // ...
+        
+        // V projection
+        // ...
+    }
+    
+    q_out[row] = half(acc_q);
+    k_out[row] = half(acc_k);
+    v_out[row] = half(acc_v);
+}
+```
+
+### Performance Impact
+
+**Before fusion:**
+- 3 separate GEMV dispatches
+- 3× activation load from DRAM
+- Llama-2-7B decode: 32 layers × 3 = **96 GEMV dispatches**
+
+**After fusion:**
+- 1 fused dispatch per layer
+- 1× activation load (reused in registers)
+- Llama-2-7B decode: **32 dispatches**
+
+**Speedup:** ~20% faster decode for Llama-2 (Q4_0, M1 Pro)
+
+---
+
+## 2. SwiGLU Fusion
+
+### Pattern
+
+```
+gate = SiLU(x)       // Swish activation: x * sigmoid(x)
+out = Mul(gate, up)  // Element-wise multiply
+```
+
+### Fused Kernel
+
+**Kernel:** `swiglu_f16`
+
+```metal
+kernel void swiglu_f16(
+    device half*       out,    // [hidden]
+    device const half* x,      // [hidden] — gate input
+    device const half* up,     // [hidden] — up projection
+    constant uint&     n,      // hidden size
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    
+    // SwiGLU: out = silu(x) * up
+    //       = (x * sigmoid(x)) * up
+    float x_val = float(x[gid]);
+    float sigmoid_x = 1.0f / (1.0f + exp(-x_val));
+    float silu_x = x_val * sigmoid_x;
+    out[gid] = half(silu_x * float(up[gid]));
+}
+```
+
+**Dispatch:** `(ceil(hidden / 256), 1, 1)` threadgroups × `(256, 1, 1)` threads
+
+### Three-Way Fusion: Gate+Up+SwiGLU
+
+**Pattern (decode path only):**
+```
+gate = QuantizedMatVec(x, W_gate)
+up   = QuantizedMatVec(x, W_up)
+out  = SwiGLU(gate, up)
+```
+
+**Fused kernel:** `fused_gate_up_swiglu_qmv_fast_q4_0`
+
+Combines two GEMVs + SwiGLU into single dispatch:
+- Loads activation `x` once
+- Computes both gate and up projections
+- Applies SwiGLU inline before writing output
+
+**Performance:** Eliminates 1 GEMV + 1 elementwise dispatch per layer.
+
+---
+
+## 3. RMSNorm + Linear Fusion
+
+### Pattern
+
+```
+norm_out = RMSNorm(x, weight)  // Per-token normalization
+out = MatMul(norm_out, W)       // Linear projection
+```
+
+Common at layer input: `RMSNorm → QKV projection`
+
+### Fused Kernel (Prefill Path)
+
+**Kernel:** `rms_norm_linear_f16`
+
+```metal
+kernel void rms_norm_linear_f16(
+    device half*       out,
+    device const half* x,
+    device const half* norm_weight,
+    device const half* linear_weight,
+    constant uint&     seq_len,
+    constant uint&     hidden,
+    constant float&    eps,
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tid  [[thread_position_in_threadgroup]],
+    threadgroup float* shared [[threadgroup(0)]])
+{
+    uint si = tgid.y;  // Sequence position
+    uint row = tgid.x; // Output row
+    
+    // Phase 1: Compute RMS (collaborative across threadgroup)
+    float sum_sq = 0.0f;
+    for (uint h = tid.x; h < hidden; h += 256) {
+        float x_val = float(x[h * seq_len + si]);
+        sum_sq += x_val * x_val;
+    }
+    
+    // Parallel reduction in shared memory
+    shared[tid.x] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid.x < stride) {
+            shared[tid.x] += shared[tid.x + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    float rms = sqrt(shared[0] / float(hidden) + eps);
+    
+    // Phase 2: Normalize + MatMul (each thread computes one output element)
+    float acc = 0.0f;
+    for (uint h = 0; h < hidden; h++) {
+        float x_val = float(x[h * seq_len + si]);
+        float norm_val = (x_val / rms) * float(norm_weight[h]);
+        acc += norm_val * float(linear_weight[row * hidden + h]);
+    }
+    
+    out[row * seq_len + si] = half(acc);
+}
+```
+
+**Performance:** Eliminates memory roundtrip for normalized activations.
+
+---
+
+## 4. Add + RMSNorm Fusion
+
+### Pattern
+
+```
+residual = Add(x, delta)       // Residual connection
+out = RMSNorm(residual, weight) // Layer normalization
+```
+
+Appears at every transformer layer boundary.
+
+### Fused Kernel
+
+**Kernel:** `add_rms_norm_f16`
+
+```metal
+kernel void add_rms_norm_f16(
+    device half*       residual_out,  // Overwrite residual buffer
+    device half*       norm_out,
+    device const half* x,
+    device const half* delta,
+    device const half* weight,
+    constant uint&     seq_len,
+    constant uint&     hidden,
+    constant float&    eps,
+    uint tgid [[threadgroup_position_in_grid]],
+    threadgroup float* shared [[threadgroup(0)]])
+{
+    uint si = tgid; // Token index
+    uint tid = thread_position_in_threadgroup();
+    
+    // Phase 1: Residual add + compute sum-of-squares
+    float local_sum_sq = 0.0f;
+    for (uint h = tid; h < hidden; h += 256) {
+        float x_val = float(x[h * seq_len + si]);
+        float delta_val = float(delta[h * seq_len + si]);
+        float residual_val = x_val + delta_val;
+        residual_out[h * seq_len + si] = half(residual_val);
+        local_sum_sq += residual_val * residual_val;
+    }
+    
+    // Phase 2: Reduce sum-of-squares
+    shared[tid] = local_sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // ... parallel reduction ...
+    float rms = sqrt(shared[0] / float(hidden) + eps);
+    
+    // Phase 3: Normalize
+    for (uint h = tid; h < hidden; h += 256) {
+        float residual_val = float(residual_out[h * seq_len + si]);
+        norm_out[h * seq_len + si] = half((residual_val / rms) * float(weight[h]));
+    }
+}
+```
+
+**Benefit:** Single pass over data instead of two separate dispatches.
+
+---
+
+## 5. RoPE + KV Cache Fusion
+
+### Pattern
+
+```
+q_rope = RoPE(q, pos)           // Apply rotary position embedding
+k_rope = RoPE(k, pos)
+KVCacheAppend(k_rope, layer)   // Write to KV cache
+KVCacheAppend(v, layer)
+```
+
+### Fused Kernel (Decode Only)
+
+**Kernel:** `rope_qk_kv_append_f16`
+
+```metal
+kernel void rope_qk_kv_append_f16(
+    device half*       q_out,
+    device const half* q_in,
+    device const half* k_in,
+    device const half* v_in,
+    device half*       kv_cache,    // [2, num_layers, num_kv_heads, max_seq, head_dim]
+    device const half* rope_table,  // Precomputed cos/sin
+    constant uint&     pos,         // Current sequence position
+    constant uint&     layer_idx,
+    constant uint&     num_kv_heads,
+    constant uint&     head_dim,
+    uint gid [[thread_position_in_grid]])
+{
+    uint head_idx = gid / head_dim;
+    uint dim_idx = gid % head_dim;
+    
+    // Load Q and K elements
+    float q_val = float(q_in[gid]);
+    float k_val = float(k_in[gid]);
+    
+    // Apply RoPE rotation
+    uint pair_idx = dim_idx / 2;
+    uint rope_offset = (pos * (head_dim / 2) + pair_idx) * 2;
+    float cos_theta = float(rope_table[rope_offset]);
+    float sin_theta = float(rope_table[rope_offset + 1]);
+    
+    if (dim_idx % 2 == 0) {
+        q_out[gid] = half(q_val * cos_theta - float(q_in[gid + 1]) * sin_theta);
+        k_val = k_val * cos_theta - float(k_in[gid + 1]) * sin_theta;
+    } else {
+        q_out[gid] = half(q_val * cos_theta + float(q_in[gid - 1]) * sin_theta);
+        k_val = k_val * cos_theta + float(k_in[gid - 1]) * sin_theta;
+    }
+    
+    // Write K to cache
+    uint kv_k_offset = layer_idx * num_kv_heads * 8192 * head_dim +
+                       head_idx * 8192 * head_dim +
+                       pos * head_dim + dim_idx;
+    kv_cache[kv_k_offset] = half(k_val);
+    
+    // Write V to cache (no RoPE)
+    uint kv_v_offset = kv_k_offset + (num_layers * num_kv_heads * 8192 * head_dim);
+    kv_cache[kv_v_offset] = v_in[gid];
+}
+```
+
+**Performance:** Eliminates 4 dispatches per layer (RoPE Q, RoPE K, KV append K, KV append V) → 1.
+
+---
+
+## 6. Super-Fusion: RoPE + KV + SDPA
+
+### Ultimate Decode Fusion
+
+**Pattern:**
+```
+q_rope = RoPE(q, pos)
+k_rope = RoPE(k, pos)
+KVCacheAppend(k_rope, layer)
+KVCacheAppend(v, layer)
+attn_out = SDPA(q_rope, k_cache, v_cache)
+```
+
+**Fused kernel:** `sdpa_rope_kv_decode_f16_128` (head_dim=128 specialization)
+
+Combines **5 operations into 1 dispatch:**
+
+```metal
+kernel void sdpa_rope_kv_decode_f16_128(
+    device half*       attn_out,    // [num_heads, head_dim]
+    device const half* q_in,
+    device const half* k_in,
+    device const half* v_in,
+    device half*       kv_cache,
+    device const half* rope_table,
+    constant uint&     pos,
+    constant uint&     layer_idx,
+    uint2 tgid [[threadgroup_position_in_grid]],  // (head_idx, 0)
+    uint  tid  [[thread_position_in_threadgroup]]) // 0..127
+{
+    uint head_idx = tgid.x;
+    uint dim_idx = tid;
+    
+    // === Phase 1: Apply RoPE to Q and K, write K to cache ===
+    float q_val = float(q_in[head_idx * 128 + dim_idx]);
+    float k_val = float(k_in[head_idx * 128 + dim_idx]);
+    
+    // RoPE rotation (inline)
+    uint pair_idx = dim_idx / 2;
+    float cos_theta = float(rope_table[pos * 64 + pair_idx * 2]);
+    float sin_theta = float(rope_table[pos * 64 + pair_idx * 2 + 1]);
+    
+    float q_rotated, k_rotated;
+    if (dim_idx % 2 == 0) {
+        float q_next = float(q_in[head_idx * 128 + dim_idx + 1]);
+        float k_next = float(k_in[head_idx * 128 + dim_idx + 1]);
+        q_rotated = q_val * cos_theta - q_next * sin_theta;
+        k_rotated = k_val * cos_theta - k_next * sin_theta;
+    } else {
+        float q_prev = float(q_in[head_idx * 128 + dim_idx - 1]);
+        float k_prev = float(k_in[head_idx * 128 + dim_idx - 1]);
+        q_rotated = q_val * cos_theta + q_prev * sin_theta;
+        k_rotated = k_val * cos_theta + k_prev * sin_theta;
+    }
+    
+    // Write K to cache
+    uint k_cache_offset = /* calculate layer/head/pos offset */;
+    kv_cache[k_cache_offset] = half(k_rotated);
+    
+    // Write V to cache (no rotation)
+    uint v_cache_offset = /* ... */;
+    kv_cache[v_cache_offset] = v_in[head_idx * 128 + dim_idx];
+    
+    threadgroup_barrier(mem_flags::mem_device);
+    
+    // === Phase 2: Scaled Dot-Product Attention ===
+    // Load full K cache for this head [pos+1, 128]
+    // Compute Q·K^T scores
+    float max_score = -INFINITY;
+    float scores[MAX_SEQ];
+    for (uint t = 0; t <= pos; t++) {
+        float score = 0.0f;
+        for (uint d = 0; d < 128; d++) {
+            float q = (d == dim_idx) ? q_rotated : /* load from shared */;
+            float k = float(kv_cache[/* layer/head/t/d */]);
+            score += q * k;
+        }
+        score *= rsqrt(128.0f); // Scale
+        scores[t] = score;
+        max_score = max(max_score, score);
+    }
+    
+    // Softmax: exp(score - max) and normalize
+    float sum_exp = 0.0f;
+    for (uint t = 0; t <= pos; t++) {
+        scores[t] = exp(scores[t] - max_score);
+        sum_exp += scores[t];
+    }
+    
+    // Attention output: weighted sum of V
+    float out_val = 0.0f;
+    for (uint t = 0; t <= pos; t++) {
+        float attn_weight = scores[t] / sum_exp;
+        float v_val = float(kv_cache[/* V cache layer/head/t/dim_idx */]);
+        out_val += attn_weight * v_val;
+    }
+    
+    attn_out[head_idx * 128 + dim_idx] = half(out_val);
+}
+```
+
+**Performance impact:**
+- Llama-2-7B (32 layers): Eliminates **160 dispatches** (5 per layer)
+- Measured speedup: **8-12% faster decode** on M1 Pro
+
+---
+
+## Custom Fusion Patterns
+
+You can define custom fusion patterns in the IR:
+
+```rust
+FusionPattern::Custom {
+    name: "MyFusion".to_string(),
+    ops: vec!["RMSNorm".to_string(), "GELU".to_string(), "MatMul".to_string()],
+}
+```
+
+Implement the fused kernel in `kernel_sources/metal/unc_kernels/` and register it:
+
+```rust
+registry.register(KernelEntry {
+    name: "my_fusion_f16".to_string(),
+    op_pattern: OpPattern::Fused(FusionPattern::Custom {
+        name: "MyFusion".to_string(),
+        ops: vec!["RMSNorm".to_string(), "GELU".to_string(), "MatMul".to_string()],
+    }),
+    source: KernelSource::Custom {
+        file: "custom/my_fusion.metal".to_string(),
+    },
+    // ... constraints and dispatch template ...
+});
+```
+
+---
+
+## Fusion Statistics
+
+**Llama-2-7B (32 layers, Q4_0 quantization):**
+
+| Fusion Type | Count | Dispatches Saved |
+|-------------|-------|------------------|
+| QKV | 32 | 64 (2 per layer) |
+| Gate+Up+SwiGLU | 32 | 64 (2 per layer) |
+| Add+RMSNorm | 64 | 64 |
+| RoPE+KV+SDPA | 32 | 128 (4 per layer) |
+| **Total** | **160** | **320 dispatches** |
+
+**Unfused:** ~450 dispatches per decode token  
+**Fused:** ~130 dispatches per decode token  
+**Reduction:** 71%
+
+---
+
+## Debugging Fusions
+
+### Inspect Fusion Decisions
+
+```bash
+unc compile --model meta-llama/Llama-2-7b-hf --quant q4-0 -o llama2 --verbose
+```
+
+Logs show:
+```
+QKV fusion: 32 groups identified
+Elementwise fusion: 32 SwiGLU patterns
+Add+RMSNorm: 64 fusions
+RoPE+KV+SDPA: 32 super-fusions
+```
+
+### Disable Specific Fusions
+
+Modify `src/compile/mod.rs` to skip passes:
+
+```rust
+impl Default for PassPipeline {
+    fn default() -> Self {
+        PassPipeline {
+            passes: vec![
+                PassKind::WeightBindingResolution,
+                PassKind::DeadCodeElimination,
+                // PassKind::QKVFusion,           // Disabled
+                // PassKind::ElementwiseFusion,   // Disabled
+                PassKind::DualPathInsertion,
+                PassKind::KernelMatching,
+                PassKind::MemoryPlanning,
+            ],
+        }
+    }
+}
+```
+
+---
+
+## Next Steps
+
+- [Compiler Passes](/advanced/compiler-passes) — Full compilation pipeline
+- [Memory Planning](/advanced/memory-planning) — Buffer allocation and aliasing
+- [Metal Backend](/advanced/metal-backend) — Kernel dispatch codegen

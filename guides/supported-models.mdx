@@ -1,0 +1,362 @@
+---
+title: 'Supported Models'
+description: 'Model architectures and HuggingFace compatibility in UNC'
+---
+
+## Supported Architectures
+
+UNC supports five major transformer architecture families, covering most popular open-source LLMs:
+
+| Architecture | HuggingFace Class | Example Models |
+|--------------|-------------------|----------------|
+| **LLaMA**    | `LlamaForCausalLM` | LLaMA, LLaMA-2, LLaMA-3, Vicuna |
+| **Mistral**  | `MistralForCausalLM` | Mistral, Mixtral |
+| **Qwen**     | `Qwen2ForCausalLM` | Qwen, Qwen-2, Qwen-3 |
+| **Phi**      | `PhiForCausalLM` | Phi-2, Phi-3 |
+| **Gemma**    | `GemmaForCausalLM` | Gemma, Gemma-2 |
+
+You can list architectures from the CLI:
+
+```bash
+unc list-architectures
+```
+
+## Architecture Families
+
+### LLaMA Family
+
+**Architecture**: Decoder-only transformer with RoPE, RMSNorm, SwiGLU
+
+**Popular Models**:
+- `meta-llama/Llama-2-7b-hf`
+- `meta-llama/Llama-2-13b-chat-hf`
+- `meta-llama/Meta-Llama-3-8B`
+- `meta-llama/Meta-Llama-3-70B-Instruct`
+- `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+- `lmsys/vicuna-7b-v1.5`
+
+**Features**:
+- RoPE (Rotary Position Embeddings)
+- RMSNorm (Root Mean Square Layer Normalization)
+- SwiGLU activation (Swish-Gated Linear Unit)
+- Grouped-query attention (GQA)
+
+**Template**: `src/frontend/templates/llama.rs`
+
+### Mistral Family
+
+**Architecture**: LLaMA-based with sliding window attention
+
+**Popular Models**:
+- `mistralai/Mistral-7B-v0.1`
+- `mistralai/Mistral-7B-Instruct-v0.3`
+- `mistralai/Mixtral-8x7B-v0.1` (MoE)
+- `mistralai/Mixtral-8x22B-Instruct-v0.1`
+
+**Features**:
+- Sliding window attention (optional)
+- Similar architecture to LLaMA
+- Mixture of Experts (MoE) for Mixtral variants
+
+**Template**: `src/frontend/templates/mistral.rs`
+
+### Qwen Family
+
+**Architecture**: Custom architecture with unique attention patterns
+
+**Popular Models**:
+- `Qwen/Qwen-7B`
+- `Qwen/Qwen-14B-Chat`
+- `Qwen/Qwen2-7B`
+- `Qwen/Qwen3-4B`
+
+**Features**:
+- Custom attention mechanism
+- Efficient for multilingual tasks
+- Strong code generation capabilities
+
+**Template**: `src/frontend/templates/qwen.rs`
+
+### Phi Family
+
+**Architecture**: Compact transformer optimized for efficiency
+
+**Popular Models**:
+- `microsoft/phi-2`
+- `microsoft/phi-3-mini-4k-instruct`
+- `microsoft/phi-3-small-8k-instruct`
+
+**Features**:
+- Highly optimized small models
+- Strong performance per parameter
+- Efficient attention mechanism
+
+**Template**: `src/frontend/templates/phi.rs`
+
+### Gemma Family
+
+**Architecture**: Google's open LLM architecture
+
+**Popular Models**:
+- `google/gemma-2b`
+- `google/gemma-7b`
+- `google/gemma-2-9b`
+- `google/gemma-2-27b-it`
+
+**Features**:
+- RoPE embeddings
+- RMSNorm
+- GeGLU activation
+- Efficient attention
+
+**Template**: `src/frontend/templates/gemma.rs`
+
+## Finding Compatible Models
+
+### On HuggingFace
+
+To find models compatible with UNC:
+
+1. **Check the model card**: Look for `model_type` in `config.json`
+2. **Search by architecture**:
+   - https://huggingface.co/models?pipeline_tag=text-generation&sort=downloads&search=llama
+   - https://huggingface.co/models?pipeline_tag=text-generation&sort=downloads&search=mistral
+
+3. **Filter by architecture class**:
+   ```python
+   # Example: Check if a model is compatible
+   from transformers import AutoConfig
+   config = AutoConfig.from_pretrained("model-name")
+   print(config.architectures)  # Should match one of the supported classes
+   ```
+
+### Model Requirements
+
+For a model to work with UNC, it must:
+
+1. **Have a supported architecture** (LLaMA, Mistral, Qwen, Phi, or Gemma)
+2. **Use safetensors format** (most modern HF models do)
+3. **Include `config.json`** with standard HuggingFace config schema
+4. **Include tokenizer files** (`tokenizer.json` or `tokenizer.model`)
+
+### Verifying Compatibility
+
+Before compiling a model, check its architecture:
+
+```bash
+# Download model config
+curl -s https://huggingface.co/MODEL_NAME/raw/main/config.json | jq '.architectures'
+
+# Example output for LLaMA:
+# ["LlamaForCausalLM"]
+```
+
+If the architecture is listed in the supported table above, the model should work with UNC.
+
+## Model Configuration
+
+### Required Config Parameters
+
+UNC reads the following from `config.json`:
+
+```json
+{
+  "architectures": ["LlamaForCausalLM"],
+  "hidden_size": 4096,
+  "intermediate_size": 11008,
+  "num_hidden_layers": 32,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 32,
+  "vocab_size": 32000,
+  "max_position_embeddings": 4096,
+  "rms_norm_eps": 1e-5,
+  "rope_theta": 10000.0,
+  "bos_token_id": 1,
+  "eos_token_id": 2
+}
+```
+
+### Optional Parameters
+
+- `rope_scaling`: RoPE scaling config for long context
+- `sliding_window`: Mistral's sliding window attention
+- `tie_word_embeddings`: Whether to tie input/output embeddings
+
+### Custom Sequence Length
+
+Override `max_position_embeddings` at compile time:
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --max-seq-len 8192 --quant q4-0
+```
+
+This is useful for:
+- Extending context beyond the model's default
+- Reducing memory usage for shorter contexts
+- Testing long-context behavior
+
+**Note**: Extending context beyond training length may degrade quality.
+
+## Using Private Models
+
+### HuggingFace Token
+
+For private or gated models (e.g., Meta's LLaMA), provide your HuggingFace token:
+
+```bash
+# Via environment variable
+export HF_TOKEN=hf_xxxxxxxxxxxxx
+unc compile --model meta-llama/Llama-2-7b-hf --quant q4-0
+
+# Or via CLI flag
+unc compile --model meta-llama/Llama-2-7b-hf --quant q4-0 --hf-token hf_xxxxxxxxxxxxx
+```
+
+### Requesting Access
+
+1. Go to the model page on HuggingFace (e.g., https://huggingface.co/meta-llama/Llama-2-7b-hf)
+2. Click "Agree and access repository" and fill out the form
+3. Wait for approval (usually instant to a few hours)
+4. Generate a token at https://huggingface.co/settings/tokens
+5. Use the token with UNC as shown above
+
+## Popular Model Examples
+
+### Small Models (1-3B)
+
+```bash
+# TinyLlama (1.1B) - Fast, efficient
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0
+
+# Phi-2 (2.7B) - Strong reasoning
+unc compile --model microsoft/phi-2 --quant q4-0
+
+# Gemma 2B - Google's compact model
+unc compile --model google/gemma-2b --quant q4-0
+```
+
+### Medium Models (4-8B)
+
+```bash
+# Qwen3 4B - Strong multilingual
+unc compile --model Qwen/Qwen3-4B --quant q4-0
+
+# LLaMA 3 8B - Meta's latest
+unc compile --model meta-llama/Meta-Llama-3-8B --quant q4-0 --hf-token $HF_TOKEN
+
+# Mistral 7B - Efficient instruction following
+unc compile --model mistralai/Mistral-7B-Instruct-v0.3 --quant q4-0
+```
+
+### Large Models (13B+)
+
+```bash
+# LLaMA 2 13B Chat - Strong chat model
+unc compile --model meta-llama/Llama-2-13b-chat-hf --quant q4-0 --hf-token $HF_TOKEN
+
+# Gemma 2 27B - Google's large instruction model
+unc compile --model google/gemma-2-27b-it --quant q4-0
+
+# Mixtral 8x7B - Mixture of Experts
+unc compile --model mistralai/Mixtral-8x7B-v0.1 --quant q4-0
+```
+
+## Model Performance Expectations
+
+### Apple M1 Pro (16GB, 200 GB/s)
+
+| Model | Size | Quant | Throughput | Memory |
+|-------|------|-------|------------|--------|
+| TinyLlama 1.1B | 1.1B | Q4_0 | ~152 tok/s | ~4 GB |
+| TinyLlama 1.1B | 1.1B | F16 | ~48 tok/s | ~4 GB |
+| Qwen3-4B | 4B | Q4_0 | ~39 tok/s | ~6 GB |
+| Mistral 7B | 7B | Q4_0 | ~20-25 tok/s | ~8 GB |
+| LLaMA 2 13B | 13B | Q4_0 | ~10-15 tok/s | ~14 GB |
+
+**Note**: Performance scales with GPU cores and memory bandwidth. M1 Max/Ultra will be faster.
+
+### Memory Requirements
+
+Estimate memory usage:
+
+```
+Model size (GB) = (Parameters × Precision bits) / (8 bits/byte × 1024³)
+
+Examples:
+- 7B @ Q4_0: (7B × 4.5) / 8e9 ≈ 3.9 GB weights
+- 7B @ Q8_0: (7B × 8.5) / 8e9 ≈ 7.4 GB weights
+- 7B @ F16:  (7B × 16) / 8e9 ≈ 14 GB weights
+
+Total memory = weights + activations + KV cache
+             ≈ weights + 2GB + (ctx_len × layers × kv_dim × 2bytes)
+```
+
+## Architecture-Specific Tips
+
+### LLaMA Models
+- Work very well with Q4_0 quantization
+- Extend context with `--max-seq-len` (trained up to 4k-8k)
+- Chat models benefit from proper prompt templates
+
+### Mistral Models
+- Efficient attention makes them fast
+- Mixtral (MoE) uses less compute per token
+- Sliding window attention enables long contexts
+
+### Qwen Models
+- Excellent multilingual performance
+- Strong code generation
+- May require higher precision (Q8_0) for best results
+
+### Phi Models
+- Extremely efficient for their size
+- Phi-2 punches above its weight (2.7B)
+- Good for on-device inference
+
+### Gemma Models
+- High quality from Google
+- Instruction-tuned variants (`-it`) work well for chat
+- Require proper prompt formatting
+
+## Troubleshooting
+
+### Model Not Found
+
+```
+Error: Model not found: user/model-name
+```
+
+**Solution**: Check the model ID is correct on HuggingFace. Ensure public or provide `--hf-token`.
+
+### Unsupported Architecture
+
+```
+Error: Architecture 'GPTNeoXForCausalLM' not yet supported
+```
+
+**Solution**: The model's architecture is not yet supported. Check the [supported architectures](#supported-architectures) table.
+
+### Out of Memory
+
+```
+Error: Failed to allocate GPU memory
+```
+
+**Solution**:
+1. Use a more aggressive quantization (`--quant q4-0`)
+2. Reduce context length (`--max-seq-len 2048`)
+3. Try a smaller model variant
+
+### Config Parsing Error
+
+```
+Error: Missing required field 'hidden_size' in config.json
+```
+
+**Solution**: The model's config is non-standard. File an issue with the model ID.
+
+## Next Steps
+
+- Learn about [Quantization](/guides/quantization) to choose the right precision
+- Read [Performance Tuning](/guides/performance-tuning) for optimization tips
+- See [Benchmarking](/guides/benchmarking) to measure model performance

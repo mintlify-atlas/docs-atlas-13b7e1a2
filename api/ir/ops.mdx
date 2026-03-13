@@ -1,0 +1,530 @@
+---
+title: "IR Operations"
+description: "Complete reference for UNC IR operation types, fusion patterns, and activation types"
+---
+
+# IR Operations
+
+Operation types for the CompIR. Ops live at the right abstraction level: above individual multiply-adds (too low for pattern matching) but below "TransformerBlock" (too high for kernel selection). Each op maps cleanly to one or more kernel launches.
+
+## Op Enum
+
+The `Op` enum represents all operations in the computation graph.
+
+```rust
+pub enum Op {
+    // Matmul/GEMM operations
+    MatMul,
+    BatchMatMul { transpose_b: bool },
+    MatVec,
+    
+    // Quantized operations
+    QuantizedMatMul { weight_dtype: DType },
+    QuantizedMatVec { weight_dtype: DType },
+    
+    // Normalization
+    RMSNorm { eps: f32 },
+    LayerNorm { eps: f32 },
+    QKNorm { eps: f32, num_heads: usize, head_dim: usize },
+    
+    // Positional encoding
+    RoPE { base: f64, interleaved: bool },
+    
+    // Activations
+    SiLU,
+    GELU,
+    ReLU,
+    
+    // Elementwise operations
+    Mul,
+    Add,
+    Scale { factor: f32 },
+    
+    // Reduction
+    Softmax { axis: i32 },
+    
+    // Attention
+    ScaledDotProductAttention {
+        causal: bool,
+        gqa_factor: usize,
+        head_dim: usize,
+        scale: f32,
+        has_mask: bool,
+        has_sinks: bool,
+    },
+    CausalMask,
+    
+    // Memory/reshape
+    Gather { axis: usize },
+    Reshape { target_shape: Vec<i64> },
+    Transpose { perm: Vec<usize> },
+    Concatenate { axis: usize },
+    Split { axis: usize, sizes: Vec<usize> },
+    
+    // KV cache
+    KVCacheAppend {
+        layer: usize,
+        role: crate::ir::types::KVRole,
+    },
+    
+    // Output
+    LogitProjection,
+    
+    // Fused operations (created by optimization passes only)
+    Fused(FusionPattern),
+}
+```
+
+## Operation Categories
+
+### Matmul / GEMM Operations
+
+Core matrix multiplication operations for dense linear transformations.
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `MatMul` | Standard dense matrix multiplication | None |
+| `BatchMatMul` | Batched matrix multiplication | `transpose_b: bool` - whether to transpose the second input |
+| `MatVec` | Optimized matrix-vector multiplication | None |
+
+**Example usage:**
+```rust
+let op = Op::MatMul;
+let batch_op = Op::BatchMatMul { transpose_b: false };
+let matvec_op = Op::MatVec;
+```
+
+### Quantized Operations
+
+Matrix multiplication operations with quantized weights for reduced memory footprint.
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `QuantizedMatMul` | Matrix multiplication with quantized weights | `weight_dtype: DType` - quantization format (Q8_0, Q4_0, Q4_1) |
+| `QuantizedMatVec` | Matrix-vector multiplication with quantized weights | `weight_dtype: DType` - quantization format |
+
+**Example usage:**
+```rust
+let qmatmul = Op::QuantizedMatMul { weight_dtype: DType::Q4_0 };
+let qmatvec = Op::QuantizedMatVec { weight_dtype: DType::Q8_0 };
+```
+
+### Normalization Operations
+
+Layer normalization variants for stabilizing training and inference.
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `RMSNorm` | Root Mean Square normalization | `eps: f32` - small constant for numerical stability |
+| `LayerNorm` | Standard layer normalization | `eps: f32` - small constant for numerical stability |
+| `QKNorm` | Per-head RMSNorm for Q/K projections (Qwen3-style) | `eps: f32`, `num_heads: usize`, `head_dim: usize` |
+
+**Example usage:**
+```rust
+// RMSNorm used in LLaMA, Mistral
+let rmsnorm = Op::RMSNorm { eps: 1e-5 };
+
+// LayerNorm used in GPT-2, BERT
+let layernorm = Op::LayerNorm { eps: 1e-12 };
+
+// QKNorm for Qwen3: normalizes each head_dim-sized chunk independently
+let qknorm = Op::QKNorm {
+    eps: 1e-6,
+    num_heads: 32,
+    head_dim: 128,
+};
+```
+
+<Note>
+`QKNorm` normalizes each head_dim-sized chunk independently using a shared weight of shape `[head_dim]`. This is specific to Qwen3-style QK normalization.
+</Note>
+
+### Positional Encoding
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `RoPE` | Rotary Positional Embedding | `base: f64` - frequency base (typically 10000.0 or 500000.0)<br/>`interleaved: bool` - whether to use interleaved rotation |
+
+**Example usage:**
+```rust
+// Standard RoPE (LLaMA, Mistral)
+let rope = Op::RoPE {
+    base: 10000.0,
+    interleaved: false,
+};
+
+// Extended context RoPE
+let rope_extended = Op::RoPE {
+    base: 500000.0,
+    interleaved: false,
+};
+```
+
+### Activation Functions
+
+Elementwise unary activation functions.
+
+| Operation | Description | Use Case |
+|-----------|-------------|----------|
+| `SiLU` | Sigmoid Linear Unit (x * sigmoid(x)) | LLaMA FFN, SwiGLU |
+| `GELU` | Gaussian Error Linear Unit | GPT-2, BERT |
+| `ReLU` | Rectified Linear Unit | Classical CNNs |
+
+**Example usage:**
+```rust
+let silu = Op::SiLU;     // Used in LLaMA SwiGLU
+let gelu = Op::GELU;     // Used in GPT-2
+let relu = Op::ReLU;     // Classical activation
+```
+
+### Elementwise Binary Operations
+
+Elementwise binary operations on tensors.
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `Mul` | Elementwise multiplication | None |
+| `Add` | Elementwise addition | None |
+| `Scale` | Multiply by constant scalar | `factor: f32` |
+
+**Example usage:**
+```rust
+let mul = Op::Mul;                  // Hadamard product
+let add = Op::Add;                  // Residual connection
+let scale = Op::Scale { factor: 0.5 }; // Attention scale
+```
+
+### Reduction Operations
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `Softmax` | Softmax normalization | `axis: i32` - dimension to normalize |
+
+**Example usage:**
+```rust
+// Softmax over last dimension (attention scores)
+let softmax = Op::Softmax { axis: -1 };
+```
+
+### Attention Operations
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `ScaledDotProductAttention` | Fused multi-head attention | `causal: bool` - apply causal mask<br/>`gqa_factor: usize` - GQA group size<br/>`head_dim: usize`<br/>`scale: f32` - attention scale (1/√d_k)<br/>`has_mask: bool`<br/>`has_sinks: bool` - sink token support |
+| `CausalMask` | Generate causal attention mask | None |
+
+**Example usage:**
+```rust
+// Standard causal self-attention (LLaMA)
+let attn = Op::ScaledDotProductAttention {
+    causal: true,
+    gqa_factor: 1,      // No grouping
+    head_dim: 128,
+    scale: 0.08838834,  // 1 / sqrt(128)
+    has_mask: false,
+    has_sinks: false,
+};
+
+// Grouped-query attention (GQA)
+let gqa_attn = Op::ScaledDotProductAttention {
+    causal: true,
+    gqa_factor: 8,      // 8 query heads per KV head
+    head_dim: 128,
+    scale: 0.08838834,
+    has_mask: false,
+    has_sinks: false,
+};
+
+// Generate causal mask
+let mask = Op::CausalMask;
+```
+
+### Memory and Reshape Operations
+
+Operations for manipulating tensor shapes and memory layout.
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `Gather` | Index into tensor along an axis | `axis: usize` |
+| `Reshape` | Change tensor shape | `target_shape: Vec<i64>` |
+| `Transpose` | Permute dimensions | `perm: Vec<usize>` |
+| `Concatenate` | Concatenate tensors along axis | `axis: usize` |
+| `Split` | Split tensor into chunks | `axis: usize`, `sizes: Vec<usize>` |
+
+**Example usage:**
+```rust
+// Gather token embeddings by index
+let gather = Op::Gather { axis: 0 };
+
+// Reshape [batch, seq, hidden] -> [batch, seq, num_heads, head_dim]
+let reshape = Op::Reshape {
+    target_shape: vec![1, -1, 32, 128],
+};
+
+// Transpose [batch, num_heads, seq, head_dim] -> [batch, seq, num_heads, head_dim]
+let transpose = Op::Transpose {
+    perm: vec![0, 2, 1, 3],
+};
+
+// Concatenate Q, K, V projections
+let concat = Op::Concatenate { axis: 2 };
+
+// Split into Q, K, V
+let split = Op::Split {
+    axis: 2,
+    sizes: vec![4096, 4096, 4096],
+};
+```
+
+### KV Cache Operations
+
+| Operation | Description | Parameters |
+|-----------|-------------|------------|
+| `KVCacheAppend` | Append new K/V vectors to cache | `layer: usize` - layer index<br/>`role: KVRole` - Key or Value |
+
+**Example usage:**
+```rust
+use crate::ir::types::KVRole;
+
+// Append key vectors to layer 0 cache
+let cache_k = Op::KVCacheAppend {
+    layer: 0,
+    role: KVRole::Key,
+};
+
+// Append value vectors to layer 0 cache
+let cache_v = Op::KVCacheAppend {
+    layer: 0,
+    role: KVRole::Value,
+};
+```
+
+### Output Operations
+
+| Operation | Description |
+|-----------|-------------|
+| `LogitProjection` | Final linear projection to vocabulary size |
+
+**Example usage:**
+```rust
+// Project hidden state to logits
+let logits = Op::LogitProjection;
+```
+
+### Fused Operations
+
+Complex fused operations created by optimization passes.
+
+| Operation | Description |
+|-----------|-------------|
+| `Fused(FusionPattern)` | A fused multi-operation kernel |
+
+**Example usage:**
+```rust
+// Fused RMSNorm + Linear
+let fused = Op::Fused(FusionPattern::RMSNormLinear);
+
+// Fused SwiGLU (gate * act(up))
+let swiglu = Op::Fused(FusionPattern::SwiGLU);
+```
+
+## FusionPattern Enum
+
+Recognized fusion patterns for creating optimized fused kernels.
+
+```rust
+pub enum FusionPattern {
+    RMSNormLinear,
+    SwiGLU,
+    QKVProjection { q_size: usize, k_size: usize, v_size: usize },
+    LinearActivation { activation: ActivationType, has_bias: bool },
+    LinearResidualAdd,
+    Custom { name: String, ops: Vec<String> },
+}
+```
+
+### Fusion Pattern Variants
+
+| Pattern | Description | Parameters |
+|---------|-------------|------------|
+| `RMSNormLinear` | Fused RMSNorm + Linear projection | None |
+| `SwiGLU` | Fused SiLU gated linear unit | None |
+| `QKVProjection` | Fused Q/K/V projections | `q_size`, `k_size`, `v_size` |
+| `LinearActivation` | Linear + activation function | `activation: ActivationType`, `has_bias: bool` |
+| `LinearResidualAdd` | Linear + residual addition | None |
+| `Custom` | Custom fusion pattern | `name: String`, `ops: Vec<String>` |
+
+**Example usage:**
+```rust
+// Fuse RMSNorm with following linear layer
+let pattern = FusionPattern::RMSNormLinear;
+
+// Fuse QKV projection (common in attention)
+let qkv = FusionPattern::QKVProjection {
+    q_size: 4096,
+    k_size: 4096,
+    v_size: 4096,
+};
+
+// Fuse linear + SiLU activation
+let linear_act = FusionPattern::LinearActivation {
+    activation: ActivationType::SiLU,
+    has_bias: false,
+};
+
+// Custom fusion
+let custom = FusionPattern::Custom {
+    name: "MyPattern".to_string(),
+    ops: vec!["RMSNorm".to_string(), "MatMul".to_string(), "Add".to_string()],
+};
+```
+
+## ActivationType Enum
+
+Activation types for fused linear+activation kernels.
+
+```rust
+pub enum ActivationType {
+    SiLU,
+    GELU,
+    ReLU,
+    None,
+}
+```
+
+| Variant | Description |
+|---------|-------------|
+| `SiLU` | Sigmoid Linear Unit |
+| `GELU` | Gaussian Error Linear Unit |
+| `ReLU` | Rectified Linear Unit |
+| `None` | No activation (identity) |
+
+## Helper Methods
+
+The `Op` enum provides utility methods for classifying operations.
+
+### `is_compute_bound()`
+
+Returns `true` if the operation is compute-bound (matmul-class).
+
+```rust
+pub fn is_compute_bound(&self) -> bool
+```
+
+**Returns true for:**
+- `MatMul`, `BatchMatMul`
+- `QuantizedMatMul`
+- `ScaledDotProductAttention`
+- `LogitProjection`
+- Fused operations: `QKVProjection`, `SwiGLU`, `RMSNormLinear`
+
+**Example:**
+```rust
+let op = Op::MatMul;
+assert!(op.is_compute_bound());
+
+let norm = Op::RMSNorm { eps: 1e-5 };
+assert!(!norm.is_compute_bound());
+```
+
+### `is_memory_bound()`
+
+Returns `true` if the operation is memory-bound (elementwise/reduction).
+
+```rust
+pub fn is_memory_bound(&self) -> bool
+```
+
+**Returns true for:**
+- Normalization: `RMSNorm`, `LayerNorm`, `QKNorm`
+- Activations: `SiLU`, `GELU`, `ReLU`
+- Elementwise: `Mul`, `Add`, `Scale`
+- Reduction: `Softmax`
+- Positional: `RoPE`
+
+**Example:**
+```rust
+let norm = Op::RMSNorm { eps: 1e-5 };
+assert!(norm.is_memory_bound());
+
+let softmax = Op::Softmax { axis: -1 };
+assert!(softmax.is_memory_bound());
+```
+
+### `is_zero_compute()`
+
+Returns `true` if the operation involves no computation (just reinterpretation).
+
+```rust
+pub fn is_zero_compute(&self) -> bool
+```
+
+**Returns true for:**
+- `Reshape`
+- `Transpose`
+- `Split`
+
+**Example:**
+```rust
+let reshape = Op::Reshape { target_shape: vec![1, -1, 4096] };
+assert!(reshape.is_zero_compute());
+
+let transpose = Op::Transpose { perm: vec![0, 2, 1] };
+assert!(transpose.is_zero_compute());
+```
+
+## Real-World Examples
+
+### LLaMA Transformer Block
+
+```rust
+// Self-attention
+let rms_norm_1 = Op::RMSNorm { eps: 1e-5 };
+let qkv_proj = Op::Fused(FusionPattern::QKVProjection {
+    q_size: 4096,
+    k_size: 512,   // GQA: 8 KV heads
+    v_size: 512,
+});
+let rope = Op::RoPE { base: 10000.0, interleaved: false };
+let attn = Op::ScaledDotProductAttention {
+    causal: true,
+    gqa_factor: 8,
+    head_dim: 128,
+    scale: 0.08838834,
+    has_mask: false,
+    has_sinks: false,
+};
+let attn_out = Op::MatMul;
+let residual_1 = Op::Add;
+
+// FFN (SwiGLU)
+let rms_norm_2 = Op::RMSNorm { eps: 1e-5 };
+let ffn = Op::Fused(FusionPattern::SwiGLU);
+let ffn_down = Op::MatMul;
+let residual_2 = Op::Add;
+```
+
+### Quantized Inference
+
+```rust
+// Use quantized matmul for all linear layers
+let qkv = Op::QuantizedMatMul { weight_dtype: DType::Q4_0 };
+let attn_proj = Op::QuantizedMatMul { weight_dtype: DType::Q4_0 };
+let ffn_up = Op::QuantizedMatMul { weight_dtype: DType::Q4_0 };
+let ffn_down = Op::QuantizedMatMul { weight_dtype: DType::Q4_0 };
+```
+
+### Decode-optimized Path
+
+```rust
+// Decode: sequence length = 1, use MatVec instead of MatMul
+let qkv = Op::MatVec;
+let attn_proj = Op::MatVec;
+let ffn_up = Op::MatVec;
+let ffn_down = Op::MatVec;
+```
+
+## See Also
+
+- [IR Types](/api/ir/types) - Type system and tensor representation
+- [IR Graph](/api/ir/graph) - Graph structure and manipulation

@@ -1,0 +1,487 @@
+---
+title: Compiler Optimization Passes
+description: Deep dive into UNC's compiler pipeline and optimization passes
+---
+
+# Compiler Optimization Passes
+
+UNC's compiler transforms the hardware-agnostic IR graph through a series of optimization passes before emitting target-specific code. This page details each pass in the pipeline.
+
+## PassPipeline Overview
+
+The `PassPipeline` orchestrates all compilation steps. The default pipeline is:
+
+```rust
+PassPipeline {
+    passes: vec![
+        PassKind::WeightBindingResolution,
+        PassKind::DeadCodeElimination,
+        PassKind::QKVFusion,
+        PassKind::ElementwiseFusion,
+        PassKind::AttentionFusion,
+        PassKind::DeadCodeElimination,    // Run again after fusion
+        PassKind::DualPathInsertion,
+        PassKind::KernelMatching,
+        PassKind::LayoutOptimization,
+        PassKind::MemoryPlanning,
+        PassKind::Scheduling,
+    ],
+}
+```
+
+Source: `src/compile/mod.rs:36-52`
+
+---
+
+## Weight Binding Pass
+
+**Location:** `src/compile/passes/weight_binding.rs`
+
+**Purpose:** Resolves byte offsets for all weight tensors by reading safetensors headers without loading weights into RAM.
+
+### How it Works
+
+1. Scans safetensors files to build a map: `tensor_name → (byte_offset, byte_size, shape, dtype)`
+2. For multi-shard models, computes cumulative offsets across shards
+3. Patches every `StorageClass::Weight` tensor in the graph with file layout info
+
+```rust
+pub fn resolve_weight_bindings(
+    graph: &mut CompGraph,
+    weight_files: &[WeightFile],
+) -> anyhow::Result<()>
+```
+
+**Key benefit:** Zero-copy weight loading via mmap at runtime.
+
+**Example output:**
+```rust
+Weight {
+    name: "model.layers.0.self_attn.q_proj.weight",
+    byte_offset: 1048576,
+    byte_size: 4194304,
+    file_shape: [4096, 4096],
+    file_dtype: BF16,
+}
+```
+
+---
+
+## Dead Code Elimination (DCE)
+
+**Location:** `src/compile/passes/dce.rs`
+
+**Purpose:** Removes nodes whose outputs are unused (not consumed by other nodes or graph outputs).
+
+### Algorithm
+
+```rust
+pub fn eliminate_dead_code(graph: &mut CompGraph) {
+    let mut used: HashSet<TensorId> = HashSet::new();
+    
+    // Mark graph outputs
+    for tid in &graph.outputs {
+        used.insert(*tid);
+    }
+    
+    // Mark all tensor inputs
+    for node in &graph.nodes {
+        for input in &node.inputs {
+            used.insert(*input);
+        }
+    }
+    
+    // Remove nodes whose output isn't used
+    graph.nodes.retain(|node| used.contains(&node.output));
+}
+```
+
+**Why run twice?** Fusion passes may create new dead code by replacing ops.
+
+---
+
+## QKV Fusion Pass
+
+**Location:** `src/compile/passes/qkv_fusion.rs`
+
+**Purpose:** Identifies Q/K/V projection triplets that share the same input and marks them for fused dispatch.
+
+### Pattern Detected
+
+```
+q = MatMul(x, Wq)
+k = MatMul(x, Wk)
+v = MatMul(x, Wv)
+```
+
+→ Fused into single kernel call at emit time
+
+### Implementation
+
+```rust
+pub fn fuse_qkv(graph: &mut CompGraph) -> usize {
+    // Group MatMuls by their first input (activation tensor)
+    let mut input_to_matmuls: HashMap<TensorId, Vec<usize>> = HashMap::new();
+    
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if matches!(node.op, Op::MatMul) && node.inputs.len() >= 2 {
+            let x = node.inputs[0];
+            input_to_matmuls.entry(x).or_default().push(idx);
+        }
+    }
+    
+    // Find groups of exactly 3 MatMuls (Q, K, V)
+    let fusion_groups: Vec<[usize; 3]> = input_to_matmuls
+        .values()
+        .filter(|idxs| idxs.len() == 3)
+        .map(|idxs| [idxs[0], idxs[1], idxs[2]])
+        .collect();
+}
+```
+
+**Note:** Actual fusion happens at emit time when generating the orchestrator. The pass only identifies candidates.
+
+**Performance impact:** Eliminates 2 dispatches per attention layer (decode path).
+
+---
+
+## Elementwise Fusion Pass
+
+**Location:** `src/compile/passes/elementwise_fusion.rs`
+
+**Purpose:** Fuses chains of memory-bound elementwise operations.
+
+### Primary Pattern: SwiGLU
+
+```
+gate = SiLU(x)
+out = Mul(gate, up)
+```
+
+→ `swiglu_f16(x, up)` — single kernel
+
+```rust
+pub fn fuse_elementwise(graph: &mut CompGraph) -> usize {
+    for i in 0..graph.nodes.len() {
+        if matches!(graph.nodes[i].op, Op::SiLU) {
+            let silu_out = graph.nodes[i].output;
+            // Find Mul that consumes SiLU output
+            for j in (i + 1)..graph.nodes.len() {
+                if matches!(graph.nodes[j].op, Op::Mul)
+                    && graph.nodes[j].inputs.contains(&silu_out)
+                {
+                    // Mark for fusion
+                    fused += 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+```
+
+### Other Elementwise Fusions
+
+- **Add + RMSNorm:** Residual add followed by normalization
+- **RoPE Q+K:** Consecutive RoPE applications on query and key
+- **KV Append K+V:** Paired key/value cache writes
+
+**Performance impact:** Reduces memory bandwidth by 2-3x for SwiGLU-heavy models.
+
+---
+
+## Dual-Path Insertion Pass
+
+**Location:** `src/compile/passes/dual_path.rs`
+
+**Purpose:** Tags matmul operations to generate both GEMM (prefill) and GEMV (decode) code paths.
+
+### Why Dual Paths?
+
+- **Prefill (seq_len > 1):** Compute-bound GEMM kernels (tiled matrix multiplication)
+- **Decode (seq_len = 1):** Memory-bound GEMV kernels (matrix-vector product)
+
+```rust
+pub fn insert_dual_paths(
+    graph: &mut CompGraph,
+    _registry: &KernelRegistry,
+    _target: &Target,
+) {
+    for node in graph.nodes.iter_mut() {
+        if is_gemm_op(&node.op) {
+            // Mark node as needing dual-path resolution
+            node.estimated_cost = Some(f64::MAX);
+        }
+    }
+}
+
+fn is_gemm_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::MatMul | Op::BatchMatMul { .. } | 
+        Op::QuantizedMatMul { .. } | Op::LogitProjection
+    )
+}
+```
+
+**Runtime dispatch:** Generated orchestrator includes:
+```objc
+if (seq_len > 1) {
+    // GEMM path: steel_gemm_f16_64x64x32
+} else {
+    // GEMV path: gemv_f16 or qmv_fast_q4_0
+}
+```
+
+---
+
+## Kernel Matching Pass
+
+**Location:** `src/compile/passes/kernel_matching.rs`
+
+**Purpose:** Assigns optimal kernels from the registry to each graph node based on target capabilities and tensor constraints.
+
+### Algorithm
+
+```rust
+pub fn match_kernels(
+    graph: &mut CompGraph,
+    registry: &KernelRegistry,
+    target: &Target,
+) -> anyhow::Result<usize> {
+    let mut unique_kernels: HashSet<KernelId> = HashSet::new();
+    
+    for node_id in node_ids {
+        let node = graph.node(node_id);
+        if node.op.is_zero_compute() {
+            continue; // Skip reshape, transpose
+        }
+        
+        // Find best kernel for this op pattern
+        if let Some(km) = registry.find_best(
+            &op, &input_tensors, &output_shape, target, model_params
+        ) {
+            unique_kernels.insert(km.kernel.id);
+            
+            // For GEMM ops, also find GEMV kernel for decode path
+            if is_gemm_op(&op) {
+                let gemv_op = to_gemv_op(&op);
+                if let Some(decode_km) = gemv_op.and_then(|gop| 
+                    registry.find_best(&gop, &input_tensors, &output_shape, target, mp)
+                ) {
+                    node.kernel = Some(KernelAssignment {
+                        path: ExecutionPath::Dual {
+                            prefill_kernel: km.kernel.id,
+                            decode_kernel: decode_km.kernel.id,
+                            // ... dispatch configs
+                        },
+                    });
+                }
+            }
+        }
+    }
+}
+```
+
+### Dynamic Shared Memory Calculation
+
+For GEMV kernels, shared memory is sized at compile time:
+
+```rust
+if matches!(op, Op::MatVec | Op::QuantizedMatVec { .. }) {
+    if km.dispatch.shared_memory_bytes > 0 {
+        // K dimension determines shared memory usage
+        let k_dim = input_tensors.first()
+            .and_then(|t| t.shape.0.first())
+            .map(|d| d.max_value())
+            .unwrap_or(0);
+        km.dispatch.shared_memory_bytes = (k_dim * 2) as u32; // f16 = 2 bytes
+    }
+}
+```
+
+**Output:** Every node has a `KernelAssignment` with kernel name, dispatch grid, and execution path.
+
+---
+
+## Barrier Analysis Pass
+
+**Location:** `src/compile/passes/barrier_analysis.rs`
+
+**Purpose:** Determines which Metal dispatches need memory barriers for concurrent execution.
+
+### Data-Flow Dependency Tracking
+
+```rust
+pub fn analyze_barriers(
+    units: &[DispatchUnit],
+    tensor_to_region: Option<&HashMap<TensorId, u32>>,
+) -> BarrierPlan {
+    let mut pending_writes: HashSet<TensorId> = HashSet::new();
+    
+    for (i, unit) in units.iter().enumerate() {
+        // Check if any read was written since last barrier
+        let conflicting_reads: Vec<&TensorId> = unit.reads.iter()
+            .filter(|read_tid| pending_writes.contains(read_tid))
+            .collect();
+        
+        if !conflicting_reads.is_empty() {
+            barrier_before.insert(i);
+            
+            // Per-resource barriers: only clear the affected regions
+            if let Some(t2r) = tensor_to_region {
+                let mut regions_to_barrier: HashSet<u32> = HashSet::new();
+                for read_tid in &conflicting_reads {
+                    if let Some(&region) = t2r.get(read_tid) {
+                        regions_to_barrier.insert(region);
+                    }
+                }
+                // Clear only barriered regions
+                pending_writes.retain(|tid| {
+                    if let Some(&r) = t2r.get(tid) {
+                        !regions_to_barrier.contains(&r)
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        
+        // Add this dispatch's writes to pending set
+        for write_tid in &unit.writes {
+            pending_writes.insert(*write_tid);
+        }
+    }
+}
+```
+
+### Generated Barrier Code
+
+```objc
+// Before dispatch that needs barrier
+if (seq_len == 1) {
+    [enc memoryBarrierWithResources:@[s->act_r[2], s->act_r[5]] 
+                        afterStages:MTLBarrierStageFragment
+                       beforeStages:MTLBarrierStageVertex];
+}
+```
+
+**Performance impact:** Selective per-resource barriers eliminate ~40% of full-scope barriers.
+
+---
+
+## Memory Planning Pass
+
+**Location:** `src/compile/memory.rs`
+
+**Purpose:** Computes static memory allocation with lifetime-based buffer aliasing.
+
+See [Memory Planning](/advanced/memory-planning) for detailed coverage.
+
+---
+
+## PSQ Pipeline Optimization
+
+**What is PSQ?** Partial Sum-of-Squares pipeline for decode path (Q4_0 only).
+
+### Problem
+
+Normal flow:
+```
+GEMV (O-proj) → Add (residual) → RMSNorm → GEMV (QKV/Gate+Up)
+```
+
+3 dispatches per layer × 32 layers = **96 extra dispatches**
+
+### Solution: Split RMSNorm Across GEMVs
+
+**Writer GEMV (O-proj):**
+```metal
+// Compute GEMV + residual add
+out[i] = gemv_result + residual[i];
+
+// Write partial sum-of-squares to psq_buf
+threadgroup_barrier(mem_flags::mem_threadgroup);
+atomic_fetch_add_explicit(&psq_buf[tg_id], local_sum_sq, ...);
+```
+
+**Reader GEMV (QKV):**
+```metal
+// Read partial sums and compute norm scale
+float total_sq = 0.0f;
+for (uint i = 0; i < num_psq_tgs; i++) {
+    total_sq += psq_buf[i];
+}
+float norm_scale = rsqrt(total_sq / h + eps);
+
+// Normalize activation on-the-fly during GEMV
+for (uint k = 0; k < K; k++) {
+    float x_val = activation[k] * weight[k] * norm_scale;
+    sum += x_val;
+}
+```
+
+**Result:** Eliminates Add+RMSNorm dispatch entirely. 32 layers × 2 per layer = **64 fewer dispatches**.
+
+---
+
+## Disabling Passes: `--unfused` Flag
+
+To benchmark unfused performance or debug fusion issues:
+
+```bash
+unc compile --model meta-llama/Llama-2-7b-hf --quant q4-0 --unfused -o llama2
+```
+
+This disables:
+- QKV fusion
+- Gate+Up fusion  
+- SwiGLU fusion
+- Add+RMSNorm fusion
+- RoPE+KV fusion
+- PSQ pipeline
+
+All operations dispatch as separate kernels.
+
+---
+
+## Compilation Result
+
+After all passes complete:
+
+```rust
+pub struct CompilationResult {
+    pub graph: CompGraph,           // Optimized graph
+    pub memory_plan: MemoryPlan,   // Buffer allocations
+    pub target: Target,            // Metal/CUDA/etc
+    pub stats: CompilationStats,
+}
+
+pub struct CompilationStats {
+    pub nodes_before: usize,
+    pub nodes_after: usize,         // After DCE
+    pub unique_kernels: usize,      // From kernel matching
+    pub fusions_applied: usize,     // QKV + elementwise + ...
+    pub estimated_flops_per_token: f64,
+    pub peak_activation_bytes: usize,
+    pub kernel_launches_per_forward: usize,
+}
+```
+
+**Example output:**
+```
+Compilation complete:
+  Nodes: 512 → 487 (after DCE)
+  Unique kernels: 23
+  Fusions: 64 (32 QKV, 16 Gate+Up, 16 SwiGLU)
+  Peak activation memory: 256 MB
+  Decode dispatches: 128 per token
+```
+
+---
+
+## Next Steps
+
+- [Kernel Fusion Strategies](/advanced/kernel-fusion) — Deep dive into fusion patterns
+- [Memory Planning](/advanced/memory-planning) — Buffer aliasing algorithm
+- [Metal Backend](/advanced/metal-backend) — Code generation and kernel dispatch

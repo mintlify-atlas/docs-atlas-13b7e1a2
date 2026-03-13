@@ -1,0 +1,120 @@
+---
+title: 'unc serve'
+description: 'Start an OpenAI-compatible API server'
+---
+
+## Overview
+
+The `unc serve` command starts an HTTP API server that provides OpenAI-compatible endpoints for the compiled model.
+
+<Warning>
+  **Not Yet Implemented** - This command is a placeholder for future functionality. The API server is under development.
+</Warning>
+
+## Command Signature
+
+```bash
+unc serve <UNC_FILE> [OPTIONS]
+```
+
+## Parameters
+
+<ParamField path="unc_file" type="path" required>
+  Path to the compiled `.unc` bundle file to serve
+</ParamField>
+
+<ParamField path="port" type="integer" default="8080">
+  Port number to listen on for HTTP requests
+</ParamField>
+
+## Planned Features
+
+When implemented, `unc serve` will provide:
+
+### OpenAI-Compatible API
+
+- **POST /v1/completions** - Text completion endpoint
+- **POST /v1/chat/completions** - Chat completions endpoint
+- **GET /v1/models** - List available models
+
+### Request Format
+
+The server will accept requests in OpenAI's format:
+
+```bash
+curl http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3",
+    "prompt": "Hello, world!",
+    "max_tokens": 200,
+    "temperature": 0.7
+  }'
+```
+
+### Response Format
+
+Responses will follow OpenAI's schema:
+
+```json
+{
+  "id": "cmpl-xxxxx",
+  "object": "text_completion",
+  "created": 1234567890,
+  "model": "llama3",
+  "choices": [
+    {
+      "text": "Hello! How can I help you today?",
+      "index": 0,
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+## Current Status
+
+Running `unc serve` currently prints:
+
+```bash
+$ unc serve llama3.unc --port 8080
+unc serve llama3.unc on port 8080 (not yet implemented)
+```
+
+## Alternatives
+
+While `unc serve` is in development, you can:
+
+### Use `unc run` Directly
+
+```bash
+unc run model.unc --prompt "Your prompt here" --max-tokens 200
+```
+
+### Build a Custom Server
+
+Integrate UNC as a library in your own Rust server:
+
+```rust
+use unc::runtime::generate::run_generation;
+use unc::unc_format::read_unc;
+
+let bundle = read_unc("model.unc")?;
+let output = run_generation(&bundle, &metallib_path, prompt, max_tokens)?;
+```
+
+## Roadmap
+
+Planned enhancements for `unc serve`:
+
+- [ ] OpenAI-compatible HTTP API
+- [ ] Streaming responses (SSE)
+- [ ] Batch inference support
+- [ ] Multiple model hosting
+- [ ] Authentication and rate limiting
+- [ ] Prometheus metrics
+- [ ] Request queueing and prioritization
+
+## Stay Updated
+
+Check the [UNC GitHub repository](https://github.com/unclecode/unc) for updates on `unc serve` implementation progress.

@@ -1,0 +1,100 @@
+---
+title: Introduction
+description: Universal Neural Compiler that transforms HuggingFace transformer models into optimized native Metal inference binaries for Apple Silicon
+---
+
+# Welcome to UNC
+
+UNC (Universal Neural Compiler) compiles HuggingFace transformer models into optimised native Metal inference binaries. No runtime framework, no Python — just a compiled binary that runs your model at near-hardware-limit speed on Apple Silicon.
+
+## Why UNC?
+
+<CardGroup cols={2}>
+  <Card title="Superior Performance" icon="rocket">
+    **1.35x faster** than mlx-lm with **25% less GPU power** consumption
+  </Card>
+  <Card title="Energy Efficient" icon="battery-full">
+    **1.7x better energy efficiency** - 74 mJ vs 125 mJ per token
+  </Card>
+  <Card title="Zero Overhead" icon="microchip">
+    **8.4x fewer CPU instructions** - no Python or framework dispatch overhead
+  </Card>
+  <Card title="Flexible Output" icon="file-code">
+    JIT bundles for development or AOT binaries for zero-dependency deployment
+  </Card>
+</CardGroup>
+
+## Performance Snapshot
+
+TinyLlama 1.1B on Apple M1 Pro (16GB, 200 GB/s):
+
+```
+UNC Q4_0  ████████████████████████████████████████████████████████████  152.0 tok/s
+mlx-lm Q4 ████████████████████████████████████████████                 112.7 tok/s
+UNC Q8_0  ███████████████████████████████                               76.6 tok/s
+UNC F16   ███████████████████                                           47.9 tok/s
+```
+
+<Note>
+See the full [performance benchmarks](/guides/benchmarking) for detailed metrics including power consumption, memory usage, and thermal characteristics.
+</Note>
+
+## Key Features
+
+- **Compile to Native**: Transform HuggingFace models into standalone Metal binaries
+- **Multiple Quantization Levels**: F16, Q8_0, Q4_0 for size/speed tradeoffs
+- **Hardware-Agnostic IR**: Clean intermediate representation with Metal backend (CUDA/ROCm/WASM planned)
+- **Advanced Optimization**: Kernel fusion, memory planning, dual-path GEMM/GEMV
+- **Broad Model Support**: LLaMA, Mistral, Qwen, Phi, Gemma architectures
+- **Two Output Modes**: JIT (.unc bundles) for development, AOT (standalone binaries) for production
+
+## How It Works
+
+```
+HuggingFace model
+       |
+  [ Frontend ]        Parse config.json + safetensors
+       |
+  [ IR Graph ]        Hardware-agnostic tensor graph
+       |
+  [ Compiler ]        Fusion, quantization, memory planning
+       |
+       +------------------+------------------+
+       |                  |                  |
+  [ Metal ]          [ CUDA ]          [ ROCm ]
+  Obj-C + Metal      (planned)         (planned)
+  shaders
+       |
+  Native binary
+```
+
+The compiler parses your HuggingFace model, builds a typed tensor IR graph, applies optimization passes (fusion, quantization, memory planning), and emits either a JIT-compiled `.unc` bundle or an AOT standalone binary.
+
+## Quick Example
+
+```bash
+# Compile TinyLlama to a .unc bundle with Q4_0 quantization
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama
+
+# Run inference
+unc run ./tinyllama.unc --prompt "The history of" --max-tokens 200
+```
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="play" href="/quickstart">
+    Get up and running in 5 minutes
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/compile">
+    Explore all commands and options
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the compiler pipeline
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/frontend">
+    Dive into the Rust API
+  </Card>
+</CardGroup>
+
+## Community
+
+UNC is open source under the MIT license. Contributions, issues, and feedback are welcome on [GitHub](https://github.com/pacifio/unc).

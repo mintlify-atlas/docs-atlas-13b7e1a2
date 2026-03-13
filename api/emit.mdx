@@ -1,0 +1,469 @@
+---
+title: 'Emit Module'
+description: 'Metal code generation: orchestrator source and AOT binaries'
+---
+
+The emit module generates executable code from optimized computation graphs.
+
+## Overview
+
+The emit module provides:
+- `emit_metal()` - Generates Metal orchestrator source and .unc bundle
+- `emit_metal_aot()` - Produces standalone Mach-O binaries
+- Runtime dispatch code generation
+- Weight layout and quantization
+
+## emit_metal()
+
+Generates Metal orchestrator source code for JIT or bundled execution.
+
+<ParamField path="emit_metal(result, out_dir, unfused)" type="Result<CompiledArtifact>">
+  Emits Metal orchestrator source and copies metallib to output directory.
+  
+  **Parameters:**
+  - `result: &CompilationResult` - Optimized graph from compiler
+  - `out_dir: &Path` - Output directory for generated files
+  - `unfused: bool` - If true, generates unfused dispatches (MLX-style)
+  
+  **Returns:** `CompiledArtifact::Metal` with paths and weight layout
+</ParamField>
+
+### Generated Files
+
+In `out_dir/`:
+- `unc_forward.m` - Orchestrator source (Objective-C + Metal)
+- `unc_kernels.metallib` - Compiled kernel library (copied from build)
+
+### CompiledArtifact
+
+```rust
+pub enum CompiledArtifact {
+    Metal {
+        metallib_path: String,
+        orchestrator_source: String,
+        weight_layout: WeightFileLayout,
+    },
+}
+
+pub struct WeightFileLayout {
+    pub strategy: WeightStrategy,
+    pub tensors: Vec<WeightTensorLayout>,
+    pub total_bytes: usize,
+}
+
+pub enum WeightStrategy {
+    MmapSafetensors,    // mmap safetensors files directly
+    MmapRepacked,       // mmap repacked/quantized weights
+    Embedded,           // embed in binary (AOT only)
+}
+
+pub struct WeightTensorLayout {
+    pub name: String,
+    pub offset: usize,
+    pub size_bytes: usize,
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+}
+```
+
+### Orchestrator Structure
+
+The generated orchestrator includes:
+
+**Constants:**
+```c
+#define UNC_NUM_LAYERS       16
+#define UNC_HIDDEN_SIZE      2048
+#define UNC_NUM_HEADS        32
+#define UNC_VOCAB_SIZE       128256
+#define UNC_MAX_SEQ_LEN      4096
+#define UNC_ACTIVATION_BYTES 134217728
+#define UNC_KV_CACHE_BYTES   67108864
+```
+
+**State Management:**
+```c
+typedef struct {
+    id<MTLDevice>       device;
+    id<MTLCommandQueue> queue;
+    id<MTLLibrary>      library;
+    id<MTLBuffer>       weight_buf;
+    id<MTLBuffer>       act_buf;
+    id<MTLBuffer>       kv_buf;
+    // ... pipeline states
+} UNCState;
+```
+
+**API Functions:**
+```c
+void unc_init(
+    const char* metallib_path,
+    void* weight_ptr,
+    size_t weight_size,
+    uint8_t weights_already_converted
+);
+
+void unc_forward(
+    const uint32_t* token_ids,
+    uint32_t seq_len,
+    uint32_t total_seq_len,
+    float* out_logits
+);
+```
+
+### Usage Example
+
+```rust
+use unc::emit::metal::emit_metal;
+use unc::compile::PassPipeline;
+use std::path::Path;
+
+// Compile model
+let pipeline = PassPipeline::default();
+let result = pipeline.run(graph, &registry, &target, &weight_files)?;
+
+// Emit Metal code
+let out_dir = Path::new("output");
+let artifact = emit_metal(&result, out_dir, false)?;
+
+match artifact {
+    CompiledArtifact::Metal { metallib_path, orchestrator_source, weight_layout } => {
+        println!("Metallib: {}", metallib_path);
+        println!("Orchestrator: {} bytes", orchestrator_source.len());
+        println!("Weight layout: {} tensors, {} bytes",
+            weight_layout.tensors.len(),
+            weight_layout.total_bytes,
+        );
+    }
+}
+```
+
+## emit_metal_aot()
+
+Produces a standalone Mach-O binary with embedded weights.
+
+<ParamField path="emit_metal_aot(result, model_files, output_binary)" type="Result<()>">
+  Emits a standalone executable binary for macOS.
+  
+  **Parameters:**
+  - `result: &CompilationResult` - Optimized graph
+  - `model_files: &ModelFiles` - Model files (for weights and tokenizer)
+  - `output_binary: &Path` - Output binary path
+  
+  **Effect:** Creates a single-file executable with embedded metallib, tokenizer, and weights
+</ParamField>
+
+### Binary Layout
+
+```
++------------------+
+| Mach-O Code      |  (orchestrator + main + tokenizer)
++------------------+
+| Padding (16KB)   |  (page alignment)
++------------------+
+| Weights          |  (safetensors data)
++------------------+
+| Weight Offset    |  (8 bytes, u64 LE)
++------------------+
+| Weight Size      |  (8 bytes, u64 LE)
++------------------+
+| Magic            |  (8 bytes: "UNCW8TSX")
++------------------+
+```
+
+### Binary Components
+
+**Embedded in Mach-O:**
+- Metal orchestrator (`unc_init`, `unc_forward`)
+- Compiled metallib (as C byte array)
+- BPE tokenizer (vocab + merges as C arrays)
+- Main function with CLI argument parsing
+
+**Appended after Mach-O:**
+- Model weights (page-aligned for mmap)
+- Trailer with offset/size/magic
+
+### Self-Loading
+
+The binary loads its own weights at runtime:
+
+```c
+static void* load_appended_weights(size_t* out_size) {
+    // 1. Get path to self via _NSGetExecutablePath
+    // 2. Read trailer (last 24 bytes)
+    // 3. Verify magic "UNCW8TSX"
+    // 4. mmap weight region at offset
+    // 5. Return pointer
+}
+```
+
+### Usage Example
+
+```rust
+use unc::emit::aot::emit_metal_aot;
+use std::path::Path;
+
+// Emit AOT binary
+let output = Path::new("model.bin");
+emit_metal_aot(&result, &model_files, output)?;
+
+println!("AOT binary: {}", output.display());
+println!("Ready to run: ./model.bin --prompt 'Hello' --max-tokens 100");
+```
+
+**Run the binary:**
+```bash
+./model.bin --prompt "Once upon a time" --max-tokens 200
+```
+
+**Output:**
+```
+, there was a young girl named Lily who loved to play outside...
+
+--- 200 tokens in 2.15s = 93.0 tok/s ---
+```
+
+### CLI Arguments
+
+```bash
+Usage: model.bin [OPTIONS]
+
+Options:
+  --prompt TEXT       Input prompt (default: "Hello")
+  --max-tokens N      Maximum tokens to generate (default: 200)
+  --help              Show this help message
+```
+
+## Quantization
+
+Both JIT and AOT emit support on-the-fly quantization.
+
+### Supported Formats
+
+<ResponseField name="f16" type="string">
+  16-bit IEEE float (default). No quantization.
+</ResponseField>
+
+<ResponseField name="q8_0" type="string">
+  8-bit quantization with 32-element blocks. Each block has 1 scale (F16) + 32 int8 values. Block size: 34 bytes.
+</ResponseField>
+
+<ResponseField name="q4_0" type="string">
+  4-bit quantization with 32-element blocks. Each block has 1 scale (F16) + 16 bytes (32 nibbles). Block size: 18 bytes.
+</ResponseField>
+
+<ResponseField name="q4_mlx" type="string">
+  MLX-style 4-bit quantization with 128-element blocks. Separated scale/data layout for vectorized GEMV. Block size: 68 bytes.
+</ResponseField>
+
+### Quantization Workflow
+
+1. **BF16 → F16 Conversion:** Weight data is converted from BFloat16 (safetensors) to IEEE F16 on GPU
+2. **Quantization:** F16 weights are quantized to Q8_0/Q4_0 on GPU using fast kernels
+3. **Layout:** Quantized data uses separated scale/data layout for vectorized GEMV
+
+### Quantization Kernels
+
+```c
+// Fast quantization with separated scale/data layout
+kernel void quantize_f16_to_q8_0_fast(
+    device const half* src,
+    device void* dst,
+    constant uint32_t& n_blocks,
+    constant uint32_t& blocks_per_row,
+    constant uint32_t& m
+);
+
+kernel void quantize_f16_to_q4_0_fast(
+    device const half* src,
+    device void* dst,
+    constant uint32_t& n_blocks,
+    constant uint32_t& blocks_per_row,
+    constant uint32_t& m
+);
+
+kernel void quantize_f16_to_q4_mlx_fast(
+    device const half* src,
+    device void* dst,
+    constant uint32_t& n_blocks,
+    constant uint32_t& blocks_per_row,
+    constant uint32_t& m
+);
+```
+
+### Memory Savings
+
+| Format | Bytes/Element | Compression | Llama-3.2-1B |
+|--------|---------------|-------------|---------------|
+| F16    | 2.0           | 1.0×        | 2.5 GB        |
+| Q8_0   | 1.06          | 1.9×        | 1.3 GB        |
+| Q4_0   | 0.56          | 3.6×        | 0.7 GB        |
+| Q4_MLX | 0.53          | 3.8×        | 0.7 GB        |
+
+## Fusion Optimizations
+
+The emitter applies emit-time fusions beyond compiler passes.
+
+### QKV Fusion
+
+Fuses 3 consecutive MatMuls with shared input into single dispatch.
+
+**Before:**
+```c
+dispatch(q_gemv, x, wq, q_out);  // 3 dispatches
+dispatch(k_gemv, x, wk, k_out);
+dispatch(v_gemv, x, wv, v_out);
+```
+
+**After:**
+```c
+dispatch(fused_qkv_gemv, x, wq, wk, wv, q_out, k_out, v_out);  // 1 dispatch
+```
+
+### Gate+Up Fusion
+
+Fuses gate and up projections in FFN.
+
+**Before:**
+```c
+dispatch(gemv, x, w_gate, gate_out);
+dispatch(gemv, x, w_up, up_out);
+```
+
+**After:**
+```c
+dispatch(fused_gate_up_gemv, x, w_gate, w_up, gate_out, up_out);
+```
+
+### SwiGLU Fusion
+
+Fuses SiLU + Mul into single kernel.
+
+**Before:**
+```c
+dispatch(silu, gate, gate_act);
+dispatch(mul, gate_act, up, out);
+```
+
+**After:**
+```c
+dispatch(swiglu, gate, up, out);
+```
+
+### Add+RMSNorm Fusion
+
+Fuses residual add with normalization.
+
+**Before:**
+```c
+dispatch(add, x, delta, sum);
+dispatch(rms_norm, sum, weight, normed);
+```
+
+**After:**
+```c
+dispatch(add_rms_norm, x, delta, weight, sum, normed);
+```
+
+### RoPE+KV+SDPA Super-Fusion
+
+Fuses 4 operations into 1 dispatch (decode only).
+
+**Before:**
+```c
+dispatch(rope, q, q_rope);           // 4 dispatches
+dispatch(rope, k, k_rope);
+dispatch(kv_append, k_rope, k_cache);
+dispatch(kv_append, v, v_cache);
+dispatch(sdpa, q_rope, k_cache, v_cache, attn_out);
+```
+
+**After:**
+```c
+dispatch(sdpa_rope_kv_decode, q, k, v, k_cache, v_cache, attn_out);  // 1 dispatch
+```
+
+**Impact:** Eliminates 22 dispatches per forward pass for 16-layer model (decode).
+
+## Output Directory Structure
+
+```
+output/
+├── unc_forward.m          # Generated orchestrator source
+├── unc_kernels.metallib    # Compiled Metal kernels
+└── model.unc               # Bundle file (via unc_format::write_unc)
+```
+
+## Complete Emit Workflow
+
+```rust
+use unc::compile::PassPipeline;
+use unc::emit::metal::emit_metal;
+use unc::unc_format::write_unc;
+use std::path::Path;
+
+// 1. Compile model
+let pipeline = PassPipeline::default();
+let result = pipeline.run(graph, &registry, &target, &weight_files)?;
+
+// 2. Emit Metal code
+let out_dir = Path::new("output");
+let artifact = emit_metal(&result, out_dir, false)?;
+
+println!("Emitted orchestrator: {} bytes", 
+    match &artifact {
+        CompiledArtifact::Metal { orchestrator_source, .. } => orchestrator_source.len(),
+    }
+);
+
+// 3. Write .unc bundle
+let bundle_path = Path::new("model.unc");
+write_unc(&result, &artifact, bundle_path)?;
+
+println!("Bundle: {}", bundle_path.display());
+
+// Or: Emit AOT binary
+use unc::emit::aot::emit_metal_aot;
+let binary_path = Path::new("model.bin");
+emit_metal_aot(&result, &model_files, binary_path)?;
+println!("AOT binary: {}", binary_path.display());
+```
+
+## Performance Characteristics
+
+### JIT Compilation
+
+**First run:**
+- Compile orchestrator: ~500ms (clang)
+- Load dylib: ~50ms
+- Initialize Metal: ~200ms
+- Convert weights BF16→F16: ~100ms
+- Quantize (Q4_0): ~300ms
+- **Total cold start: ~1.2s**
+
+**Subsequent runs (cached):**
+- Load dylib: ~50ms
+- Initialize Metal: ~200ms
+- Load cached F16 weights: ~50ms
+- **Total warm start: ~300ms**
+
+### AOT Binary
+
+**Single-file deployment:**
+- Binary size: code (~2 MB) + weights (700 MB for Q4_0 1B model)
+- Startup time: ~200ms (Metal init + BF16→F16)
+- No JIT compilation required
+- Self-contained (no dependencies)
+
+### Quantization Performance
+
+**Q4_0 vs F16 (Llama-3.2-1B on M3 Max):**
+- Decode: 190 tok/s (Q4_0) vs 140 tok/s (F16) - **1.36× faster**
+- Memory: 0.7 GB vs 2.5 GB - **3.6× smaller**
+- Quality: &lt;1% perplexity increase
+
+## Related
+
+- [Compiler Module](/api/compiler) - Optimization pipeline
+- [Runtime Module](/api/runtime) - Executing compiled models
+- [Kernel Module](/api/kernel) - Kernel library

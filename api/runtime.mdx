@@ -1,0 +1,463 @@
+---
+title: 'Runtime Module'
+description: 'JIT compilation, weight loading, and text generation'
+---
+
+The runtime module executes compiled UNC models with JIT compilation and text generation.
+
+## Overview
+
+The runtime provides:
+- `run_generation()` - Main entry point for inference
+- JIT compilation with caching
+- Weight loading with mmap and caching
+- Tokenizer integration
+- Autoregressive decoding loop
+
+## run_generation()
+
+Runs text generation on a compiled .unc model.
+
+<ParamField path="run_generation(bundle, metallib_path, prompt, max_tokens)" type="Result<()>">
+  Executes inference with JIT compilation, weight loading, and token generation.
+  
+  **Parameters:**
+  - `bundle: &UNCBundle` - Loaded .unc bundle (from `read_unc()`)
+  - `metallib_path: &Path` - Path to unc_kernels.metallib
+  - `prompt: &str` - Input text prompt
+  - `max_tokens: usize` - Maximum tokens to generate
+  
+  **Effect:** Prints generated text to stdout and performance stats to stderr
+</ParamField>
+
+### Workflow
+
+1. **JIT Cache Resolution**
+   - Hash orchestrator source (CRC32)
+   - Check cache: `~/.cache/unc/jit/{hash}/unc_forward.dylib`
+   - If missing, compile with clang
+
+2. **Weight Cache Resolution**
+   - Check for pre-converted F16 weights: `~/.cache/unc/weights/{hash}.bin`
+   - If missing, load original safetensors and convert on GPU
+
+3. **Dylib Loading**
+   - `dlopen` the compiled orchestrator
+   - Resolve symbols: `unc_init`, `unc_forward`
+
+4. **Initialization**
+   - Call `unc_init(metallib_path, weight_ptr, weight_size, converted_flag)`
+   - Allocate Metal buffers (activations, KV cache)
+   - Convert BF16→F16 (if not cached)
+   - Quantize weights (if quant != f16)
+
+5. **Tokenization**
+   - Load tokenizer from bundle metadata
+   - Encode prompt to token IDs
+   - Prepend BOS token
+
+6. **Prefill**
+   - Forward pass with full prompt: `unc_forward(token_ids, n_tokens, n_tokens, logits)`
+   - Fills KV cache with prompt context
+
+7. **Decode Loop**
+   - Sample next token (argmax or sampling)
+   - Print decoded token
+   - Forward pass with single token: `unc_forward(&next, 1, position, logits)`
+   - Repeat until EOS or max_tokens
+
+8. **Stats**
+   - Print tokens/sec to stderr
+
+### Usage Example
+
+```rust
+use unc::runtime::generate::run_generation;
+use unc::unc_format::read_unc;
+use std::path::Path;
+
+// Load .unc bundle
+let bundle = read_unc(Path::new("model.unc"))?;
+
+// Run generation
+run_generation(
+    &bundle,
+    Path::new("output/unc_kernels.metallib"),
+    "Once upon a time",
+    200,
+)?;
+```
+
+**Output:**
+```
+, there was a young girl named Lily who loved to play outside. One day, she 
+found a small, lost puppy in the park. The puppy was very sad and scared...
+
+--- 200 tokens in 2.15s = 93.0 tok/s ---
+```
+
+## JIT Compilation
+
+The runtime JIT-compiles the orchestrator source on first run.
+
+### Cache Directory
+
+```
+~/.cache/unc/jit/{hash}/
+├── unc_forward.m         # Orchestrator source (copied)
+└── unc_forward.dylib     # Compiled shared library
+```
+
+**Hash:** CRC32 of orchestrator source (8 hex digits)
+
+### Compilation Command
+
+```bash
+clang \
+  -fobjc-arc \
+  -framework Metal \
+  -framework Foundation \
+  -shared \
+  -fPIC \
+  -O2 \
+  -o unc_forward.dylib \
+  unc_forward.m
+```
+
+**Time:** ~500ms (cold), ~0ms (cached)
+
+### Symbol Resolution
+
+```rust
+use libloading::Library;
+
+let lib = unsafe { Library::new("unc_forward.dylib")? };
+
+let unc_init: Symbol<FnUncInit> = unsafe { lib.get(b"unc_init\0")? };
+let unc_forward: Symbol<FnUncForward> = unsafe { lib.get(b"unc_forward\0")? };
+```
+
+### FFI Signatures
+
+```rust
+type FnUncInit = unsafe extern "C" fn(
+    metallib_path: *const c_char,
+    weight_ptr: *mut c_void,
+    weight_size: usize,
+    weights_already_converted: u8,
+);
+
+type FnUncForward = unsafe extern "C" fn(
+    token_ids: *const u32,
+    n_tokens: u32,
+    position: u32,
+    out_logits: *mut f32,
+);
+```
+
+## Weight Loading
+
+Weights are mmap'd from safetensors files with optional caching.
+
+### mmap_weights()
+
+```rust
+pub fn mmap_weights(paths: &[String]) -> Result<MappedWeights> {
+    // mmap all safetensors files
+    // concatenate into single contiguous region
+}
+
+pub struct MappedWeights {
+    pub ptr: *const u8,
+    pub size: usize,
+}
+```
+
+**Advantage:** Zero-copy loading. OS pages in data on-demand.
+
+### Weight Cache
+
+Converted F16 weights are cached to skip BF16→F16 conversion.
+
+```
+~/.cache/unc/weights/{hash}.bin
+```
+
+**Hash:** SHA256 of (weight_file_paths + orchestrator_hash)
+
+**Format:** Raw F16 bytes, same layout as safetensors
+
+**Savings:** ~100ms conversion time on M3 Max for 1B model
+
+### Cache Workflow
+
+```rust
+use unc::runtime::cache::{compute_cache_key, find_cached_weights};
+
+// Compute cache key
+let cache_key = compute_cache_key(weight_paths, orch_hash);
+
+// Check cache
+let cached_path = find_cached_weights(&cache_key);
+let weights_converted = cached_path.is_some();
+
+let weights = if let Some(ref path) = cached_path {
+    log::info!("Weight cache hit: {}", path.display());
+    mmap_weights(&[path.to_str().unwrap().to_string()])?
+} else {
+    log::info!("Weight cache miss - will convert and cache");
+    mmap_weights(weight_paths)?
+};
+
+// Initialize with converted flag
+unsafe {
+    unc_init(
+        metallib_path.as_ptr(),
+        weights.ptr as *mut c_void,
+        weights.size,
+        if weights_converted { 1 } else { 0 },
+    );
+}
+```
+
+## Tokenizer Integration
+
+The runtime uses HuggingFace tokenizer.json files.
+
+### UNCTokenizer
+
+```rust
+pub struct UNCTokenizer {
+    tokenizer: tokenizers::Tokenizer,
+}
+
+impl UNCTokenizer {
+    pub fn from_file(path: &Path) -> Result<Self> { /* ... */ }
+    
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> { /* ... */ }
+    
+    pub fn decode_incremental(&self, ids: &[u32]) -> Result<String> { /* ... */ }
+    
+    pub fn eos_token_id(&self) -> Option<u32> { /* ... */ }
+}
+```
+
+### Incremental Decoding
+
+The runtime decodes incrementally for streaming output.
+
+```rust
+let mut generated_ids = vec![bos_token_id];
+generated_ids.extend_from_slice(&prompt_ids);
+
+for step in 0..max_tokens {
+    let next = sample(&logits);
+    generated_ids.push(next);
+    
+    // Decode only new text (handles UTF-8 continuation)
+    let text = tokenizer.decode_incremental(&generated_ids)?;
+    print!("{}", text);
+    stdout().flush()?;
+    
+    // Forward pass
+    unc_forward(&next, 1, position, logits.as_mut_ptr());
+}
+```
+
+**Advantage:** Handles UTF-8 byte continuation properly. Prints text as soon as complete characters are available.
+
+## Inference Loop
+
+Autoregressive decoding with prefill and decode phases.
+
+### Prefill Phase
+
+Processes entire prompt in parallel.
+
+```rust
+let prompt_ids = tokenizer.encode("Once upon a time")?;
+let mut ids = vec![bos_token_id];
+ids.extend_from_slice(&prompt_ids);
+
+let n_tokens = ids.len() as u32;
+let mut logits = vec![0.0f32; vocab_size];
+
+unsafe {
+    unc_forward(
+        ids.as_ptr(),
+        n_tokens,        // seq_len
+        n_tokens,        // total_seq_len (= seq_len for prefill)
+        logits.as_mut_ptr(),
+    );
+}
+
+let next = argmax(&logits);
+```
+
+**Cost:** ~10-50ms for 10-token prompt (model-dependent)
+
+**KV Cache:** Filled with prompt context
+
+### Decode Phase
+
+Generates one token at a time.
+
+```rust
+let mut position = n_tokens + 1;
+let mut next = first_token;
+
+for _step in 0..max_tokens {
+    // Decode token to text
+    generated_ids.push(next);
+    let text = tokenizer.decode_incremental(&generated_ids)?;
+    print!("{}", text);
+    
+    // Check for EOS
+    if next == eos_token_id {
+        break;
+    }
+    
+    // Forward pass (single token)
+    unsafe {
+        unc_forward(
+            &next as *const u32,
+            1,              // seq_len = 1
+            position,       // total_seq_len (grows each step)
+            logits.as_mut_ptr(),
+        );
+    }
+    
+    // Sample next token
+    next = argmax(&logits);
+    position += 1;
+}
+```
+
+**Cost per token:** ~5-20ms (model and hardware dependent)
+
+### Sampling
+
+```rust
+fn argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+```
+
+**Current:** Greedy sampling (argmax)
+
+**Future:** Temperature, top-p, top-k sampling
+
+## Performance Stats
+
+The runtime tracks and reports generation performance.
+
+```rust
+let decode_start = std::time::Instant::now();
+let mut decode_tokens = 0u32;
+
+for step in 0..max_tokens {
+    // ... generate token
+    decode_tokens += 1;
+}
+
+let decode_elapsed = decode_start.elapsed();
+let tok_per_sec = decode_tokens as f64 / decode_elapsed.as_secs_f64();
+
+eprintln!("\n--- {} tokens in {:.2}s = {:.1} tok/s ---",
+    decode_tokens,
+    decode_elapsed.as_secs_f64(),
+    tok_per_sec,
+);
+```
+
+**Example output:**
+```
+--- 200 tokens in 2.15s = 93.0 tok/s ---
+```
+
+## Complete Example
+
+```rust src/run.rs
+use unc::runtime::generate::run_generation;
+use unc::unc_format::read_unc;
+use std::path::{Path, PathBuf};
+
+fn main() -> anyhow::Result<()> {
+    // 1. Load .unc bundle
+    let unc_path = Path::new("model.unc");
+    let bundle = read_unc(unc_path)?;
+    
+    println!("Model: {}", bundle.graph.metadata.model_id);
+    println!("Architecture: {:?}", bundle.graph.metadata.architecture);
+    println!("Quantization: {}", bundle.graph.metadata.quant);
+    
+    // 2. Resolve metallib path
+    let metallib_path = unc_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("output/unc_kernels.metallib");
+    
+    if !metallib_path.exists() {
+        eprintln!("Error: metallib not found at {}", metallib_path.display());
+        std::process::exit(1);
+    }
+    
+    // 3. Run generation
+    let prompt = "The future of AI is";
+    let max_tokens = 100;
+    
+    println!("Prompt: {}", prompt);
+    println!("Generating {} tokens...\n", max_tokens);
+    
+    run_generation(&bundle, &metallib_path, prompt, max_tokens)?;
+    
+    Ok(())
+}
+```
+
+**Run:**
+```bash
+cargo run --release -- run model.unc --prompt "The future of AI is" --max-tokens 100
+```
+
+## Error Handling
+
+### Common Errors
+
+**JIT compilation failed:**
+```
+Error: JIT compile failed (clang exit 1)
+```
+- **Cause:** clang not found or compilation error
+- **Fix:** Install Xcode Command Line Tools: `xcode-select --install`
+
+**Symbol not found:**
+```
+Error: unc_init symbol not found
+```
+- **Cause:** Dylib version mismatch or compilation error
+- **Fix:** Clear cache: `rm -rf ~/.cache/unc/jit/*`
+
+**Metallib not found:**
+```
+Failed to load metallib from /path/to/unc_kernels.metallib
+```
+- **Cause:** Missing or incorrect metallib path
+- **Fix:** Ensure `unc_kernels.metallib` is in output directory
+
+**Weight mmap failed:**
+```
+Error: mmap failed for /path/to/weights.safetensors
+```
+- **Cause:** File doesn't exist or is corrupted
+- **Fix:** Re-download model with `ModelLoader`
+
+## Related
+
+- [Emit Module](/api/emit) - Code generation
+- [Frontend Module](/api/frontend) - Model loading

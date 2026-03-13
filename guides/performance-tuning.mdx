@@ -1,0 +1,453 @@
+---
+title: 'Performance Tuning'
+description: 'Optimize UNC inference for maximum speed and efficiency'
+---
+
+## Overview
+
+UNC is designed to run at near-hardware-limit speeds on Apple Silicon. This guide covers optimization strategies to maximize throughput, minimize latency, and improve energy efficiency.
+
+## Choosing the Right Quantization
+
+### Quick Decision Guide
+
+```
+Your Priority          → Recommended Quantization
+─────────────────────────────────────────────────
+Maximum speed          → Q4_0
+Best quality           → F16 or BF16
+Balanced               → Q8_0
+Minimal memory         → Q4_0
+Longest battery life   → Q4_0
+```
+
+### Performance Impact
+
+On Apple M1 Pro (TinyLlama 1.1B):
+
+| Quantization | Throughput | Relative | GPU Power | Energy/Token |
+|--------------|------------|----------|-----------|-------------|
+| Q4_0         | 152 tok/s  | 3.2x     | 11.3W     | 74 mJ       |
+| Q8_0         | 76.6 tok/s | 1.6x     | ~12W      | ~157 mJ     |
+| F16          | 47.9 tok/s | 1.0x     | ~15W      | ~313 mJ     |
+
+**Key insight**: Q4_0 is both the fastest AND most energy-efficient option. The only tradeoff is a small quality loss (~5%).
+
+See the [Quantization Guide](/guides/quantization) for detailed tradeoffs.
+
+## JIT vs AOT Performance
+
+UNC supports two compilation modes:
+
+### JIT (Just-In-Time)
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o model.unc
+```
+
+**Characteristics**:
+- Produces a `.unc` bundle + `.metallib` shader library
+- First run: ~2s init (clang JIT compile + weight loading)
+- Subsequent runs: ~1.7s init (cached binary + weight loading)
+- Requires clang for first run
+- Smaller disk footprint (544 KB bundle + separate weights)
+
+**Inference performance**: Identical to AOT after init
+
+### AOT (Ahead-of-Time)
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 --binary -o model
+```
+
+**Characteristics**:
+- Produces a standalone Mach-O binary with embedded weights
+- ~1.5s init (no compilation, just mmap + GPU allocation)
+- Zero dependencies (no clang, no HuggingFace cache)
+- Larger disk footprint (~2.1 GB for TinyLlama Q4_0)
+- Ready for distribution
+
+**Inference performance**: Identical to JIT
+
+### Performance Comparison (TinyLlama Q4_0)
+
+| Metric | JIT (cached) | AOT | Winner |
+|--------|--------------|-----|--------|
+| Init time | 1.7s | 1.5s | AOT (12% faster) |
+| Throughput (cold) | 152 tok/s | 152 tok/s | Tie |
+| Throughput (warm) | 100-110 tok/s | 100-110 tok/s | Tie |
+| GPU power | 11.2W | 11.4W | JIT (2% less) |
+| CPU power | 0.9W | 2.1W | JIT (57% less) |
+| SoC power | 12.1W | 13.5W | JIT (10% less) |
+| Peak memory | 4.24 GB | 4.11 GB | AOT (3% less) |
+| Disk usage | 544 KB + weights | 2.1 GB | JIT (78% less) |
+
+**Recommendation**:
+- **Use JIT** for development, iteration, and when disk space matters
+- **Use AOT** for deployment, distribution, and slightly faster cold starts
+
+## Memory Planning
+
+### Memory Budget Breakdown
+
+UNC's memory usage consists of:
+
+```
+Total GPU memory = Weights + Activations + KV Cache + Overhead
+```
+
+#### 1. Weights
+
+Model weights depend on parameter count and quantization:
+
+```
+Weight size = Parameters × Bytes per weight
+
+Bytes per weight:
+- F32:  4.0 bytes
+- F16:  2.0 bytes
+- BF16: 2.0 bytes
+- Q8_0: ~1.0 bytes (with scaling factors)
+- Q4_0: ~0.55 bytes (with scaling factors)
+
+Example (TinyLlama 1.1B):
+- F16:  1.1B × 2.0 = 2.2 GB
+- Q8_0: 1.1B × 1.0 = 1.1 GB
+- Q4_0: 1.1B × 0.55 = 0.6 GB
+```
+
+#### 2. Activations
+
+Activation memory for intermediate tensors. UNC's memory planner uses buffer aliasing to minimize this:
+
+```
+Typical activation budget: 200-500 MB for 1-7B models
+```
+
+UNC's compiler pass pipeline includes:
+- Dead code elimination
+- Buffer aliasing (reuse memory across non-overlapping tensors)
+- Fusion (reduce intermediate allocations)
+
+You can see the activation budget in compile output:
+
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o model.unc
+# Output:
+#   compile: 245 nodes, 89 kernels, activation=312 MB, kv=256 MB
+```
+
+#### 3. KV Cache
+
+Key-Value cache stores attention keys/values for all previous tokens:
+
+```
+KV cache size = 2 × Layers × Heads × HeadDim × MaxSeqLen × 2 bytes (F16)
+
+Example (TinyLlama, max_seq_len=4096):
+  2 × 22 layers × 32 heads × 64 dim × 4096 tokens × 2 bytes
+  = 256 MB
+
+Scaling with context:
+- 2048 tokens: 128 MB
+- 4096 tokens: 256 MB
+- 8192 tokens: 512 MB
+```
+
+#### 4. Overhead
+
+Metal framework, command buffers, driver overhead:
+
+```
+Typical overhead: ~1-2 GB
+```
+
+### Total Memory Example (TinyLlama Q4_0)
+
+```
+Weights:     0.6 GB (Q4_0)
+Activations: 0.3 GB (from memory planner)
+KV cache:    0.3 GB (4096 ctx)
+Overhead:    1.5 GB
+────────────────────
+Total:       ~2.7 GB
+Peak RSS:    4.2 GB (includes CPU-side buffers)
+```
+
+### Reducing Memory Usage
+
+1. **Use aggressive quantization**:
+   ```bash
+   --quant q4-0  # Smallest weights
+   ```
+
+2. **Reduce context length**:
+   ```bash
+   --max-seq-len 2048  # Half the KV cache size
+   ```
+
+3. **Use smaller models**: 1-4B models fit comfortably on 8GB GPUs
+
+## Thermal Throttling
+
+### The Cold-Start Effect
+
+Apple Silicon GPUs throttle when hot, leading to performance degradation:
+
+| State | Throughput | GPU Temp | Duration |
+|-------|------------|----------|----------|
+| Cold  | 152 tok/s  | 66-70°C  | First 100-150 tokens |
+| Warm  | 100-110 tok/s | 70-75°C | After throttling |
+| Drop  | -30-40%    | —        | — |
+
+### Sustaining Performance
+
+#### 1. Improve Cooling
+
+- Use on a hard surface (not lap or soft materials)
+- Ensure good airflow around MacBook
+- Consider a laptop stand for better ventilation
+- Avoid hot environments
+
+#### 2. Reduce Power Draw
+
+Use lower quantization or smaller models:
+
+```bash
+# Q4_0 uses 25% less GPU power than F16
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0
+```
+
+#### 3. Batch Processing
+
+For long generations, throttling is unavoidable. Plan for sustained throughput:
+
+```
+Sustained throughput ≈ 70% of cold-start throughput
+
+Example (TinyLlama Q4_0):
+Cold: 152 tok/s
+Sustained: ~105 tok/s
+```
+
+#### 4. Monitor Temperatures
+
+Use `macmon` to track GPU temperature:
+
+```bash
+brew install vladkens/tap/macmon
+macmon --hide cpu,gpu-e,gpu-p --interval 1
+```
+
+Watch for:
+- GPU temp > 70°C: Throttling may begin
+- GPU temp > 75°C: Significant throttling
+- GPU temp > 85°C: Heavy throttling
+
+## Bandwidth Utilization
+
+### Memory Bandwidth Limits
+
+Apple Silicon memory bandwidth by chip:
+
+| Chip | Memory Bandwidth |
+|------|------------------|
+| M1, M1 Pro | 200 GB/s |
+| M1 Max | 400 GB/s |
+| M1 Ultra | 800 GB/s |
+| M2, M2 Pro | 200 GB/s |
+| M2 Max | 400 GB/s |
+| M2 Ultra | 800 GB/s |
+| M3, M3 Pro | 200-300 GB/s |
+| M3 Max | 400 GB/s |
+| M4 | 120-273 GB/s |
+| M4 Pro | 273 GB/s |
+| M4 Max | 546 GB/s |
+
+### Current Utilization
+
+UNC achieves ~48% bandwidth utilization on M1 Pro:
+
+```
+Effective bandwidth (Q4_0 TinyLlama):
+  Weight size: 618 MB
+  Throughput: 152 tok/s
+  Data per token: 618 MB
+  
+  Bandwidth = 618 MB × 152 tok/s ≈ 97 GB/s
+  Utilization = 97 / 200 = 48%
+```
+
+### Why Not 100%?
+
+1. **Non-GEMM operations**: RMSNorm, RoPE, SDPA, etc. are compute-bound
+2. **KV cache reads**: Additional memory traffic not included in weight size
+3. **Activation reads/writes**: Intermediate tensors
+4. **Quantization overhead**: Dequantization takes GPU cycles
+
+### Improving Utilization
+
+UNC's compiler already applies:
+
+- **Kernel fusion**: QKV fusion, Gate+Up fusion, RoPE+KV fusion
+- **Operator fusion**: Add+RMSNorm, GEMV+activation
+- **Dual-path**: Separate GEMM (batch) and GEMV (single-token) kernels
+
+Further optimizations are architecture-dependent and ongoing.
+
+## Profiling and Monitoring
+
+### GPU Power Monitoring
+
+Use `macmon` for real-time power monitoring:
+
+```bash
+brew install vladkens/tap/macmon
+
+# Monitor during inference
+macmon --hide cpu,gpu-e,gpu-p --interval 200
+```
+
+Example output during decode:
+
+```
+GPU: ████████████████████████████████████  11.2W
+CPU: ███                                    0.9W
+SOC: ██████████████████████████████████████ 12.1W
+```
+
+### System Metrics
+
+Use `/usr/bin/time` for CPU and memory stats:
+
+```bash
+/usr/bin/time -l unc run model.unc --prompt "Hello" --max-tokens 200
+```
+
+Key metrics:
+- `maximum resident set size`: Peak memory (bytes)
+- `instructions retired`: CPU instruction count
+- `voluntary context switches`: Scheduler activity
+
+### Metal Profiling
+
+For detailed GPU profiling, use Xcode Instruments:
+
+1. Open Instruments.app
+2. Choose "Metal System Trace"
+3. Launch your UNC binary
+4. Profile decode phase
+
+You can see:
+- GPU utilization per shader
+- Memory bandwidth usage
+- Kernel dispatch latency
+- Command buffer encoding time
+
+### Benchmarking Scripts
+
+Create a simple benchmark script:
+
+```bash
+#!/bin/bash
+# benchmark.sh
+
+MODEL="$1"
+TOKENS=200
+
+echo "Benchmarking $MODEL..."
+
+for i in {1..5}; do
+  echo "Run $i:"
+  /usr/bin/time -l unc run "$MODEL" \
+    --prompt "The history of" \
+    --max-tokens $TOKENS 2>&1 | \
+    grep -E '(tok/s|maximum resident set size)'
+  sleep 30  # Cool down between runs
+done
+```
+
+Usage:
+
+```bash
+chmod +x benchmark.sh
+./benchmark.sh model.unc
+```
+
+## Performance Checklist
+
+### For Maximum Speed
+
+- [ ] Use Q4_0 quantization
+- [ ] Use AOT mode for slightly faster init
+- [ ] Ensure system is cool before long runs
+- [ ] Close background apps to reduce thermal load
+- [ ] Use batch inference for long generations
+
+### For Maximum Quality
+
+- [ ] Use F16 or BF16 quantization
+- [ ] Increase context length if needed
+- [ ] Test with Q8_0 as a compromise
+- [ ] Validate quality on your specific prompts
+
+### For Maximum Efficiency
+
+- [ ] Use Q4_0 (1.7x more energy-efficient than F16)
+- [ ] Use JIT mode (10% less SoC power than AOT)
+- [ ] Reduce context length to minimum needed
+- [ ] Monitor GPU power with macmon
+
+### For Deployment
+
+- [ ] Use AOT mode for standalone binary
+- [ ] Test memory usage on target hardware
+- [ ] Measure sustained (warm) throughput
+- [ ] Profile with real workloads
+- [ ] Test thermal behavior over 5+ minutes
+
+## Expected Performance
+
+### Apple M1 Pro (16GB, 200 GB/s)
+
+| Model | Params | Quant | Cold | Warm | Memory |
+|-------|--------|-------|------|------|--------|
+| TinyLlama | 1.1B | Q4_0 | 152 tok/s | 105 tok/s | 4.2 GB |
+| TinyLlama | 1.1B | F16  | 48 tok/s  | 35 tok/s  | 4.2 GB |
+| Qwen3-4B  | 4B   | Q4_0 | 39 tok/s  | 27 tok/s  | ~6 GB  |
+| Mistral-7B| 7B   | Q4_0 | ~23 tok/s | ~16 tok/s | ~8 GB  |
+
+### Apple M1 Max (64GB, 400 GB/s)
+
+Expect ~1.5-2x throughput vs M1 Pro due to double bandwidth.
+
+### Apple M1 Ultra (128GB, 800 GB/s)
+
+Expect ~2.5-3x throughput vs M1 Pro for large models that use the full bandwidth.
+
+## Troubleshooting Performance Issues
+
+### Slower Than Expected
+
+1. **Check quantization**: Ensure you're using Q4_0 for speed
+2. **Check thermal state**: Monitor GPU temp with macmon
+3. **Check memory pressure**: Ensure &lt;80% memory usage
+4. **Close background apps**: Reduce GPU contention
+
+### High Memory Usage
+
+1. **Reduce context length**: `--max-seq-len 2048`
+2. **Use Q4_0**: Smallest weights
+3. **Check for memory leaks**: Monitor over time
+
+### Thermal Throttling
+
+1. **Improve ventilation**: Use laptop stand
+2. **Cool down**: Wait 30s between runs
+3. **Reduce power**: Use Q4_0 instead of F16
+
+## Next Steps
+
+- See [Benchmarking](/guides/benchmarking) for detailed measurement methodology
+- Read [Quantization](/guides/quantization) for precision tradeoffs
+- Check [Supported Models](/guides/supported-models) for model-specific tips

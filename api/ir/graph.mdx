@@ -1,0 +1,775 @@
+---
+title: "IR Graph"
+description: "Complete reference for UNC IR graph structure, node representation, and metadata"
+---
+
+# IR Graph
+
+CompIR: The computation graph. A DAG of `Node`s where every node has a concrete op, fully-resolved input/output shapes, and (after the kernel matching pass) an assigned kernel.
+
+## Node Representation
+
+### Node Struct
+
+A single operation in the computation graph.
+
+```rust
+pub struct Node {
+    pub id: NodeId,
+    pub op: Op,
+    pub inputs: Vec<TensorId>,
+    pub output: TensorId,
+    pub extra_outputs: Vec<TensorId>,
+    pub attrs: AttrMap,
+    pub kernel: Option<KernelAssignment>,
+    pub estimated_cost: Option<f64>,
+}
+```
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `NodeId` | Unique identifier for this node |
+| `op` | `Op` | The operation type (MatMul, RMSNorm, etc.) |
+| `inputs` | `Vec<TensorId>` | Input tensor IDs |
+| `output` | `TensorId` | Primary output tensor ID |
+| `extra_outputs` | `Vec<TensorId>` | Additional outputs (e.g., Split produces multiple outputs) |
+| `attrs` | `AttrMap` | Op-specific attributes |
+| `kernel` | `Option<KernelAssignment>` | Assigned kernel after matching pass |
+| `estimated_cost` | `Option<f64>` | Estimated execution cost in microseconds |
+
+**Example:**
+```rust
+let node = Node {
+    id: NodeId(0),
+    op: Op::RMSNorm { eps: 1e-5 },
+    inputs: vec![TensorId(0), TensorId(1)],  // input, weight
+    output: TensorId(2),
+    extra_outputs: vec![],
+    attrs: HashMap::new(),
+    kernel: None,  // Assigned later by kernel matching
+    estimated_cost: None,
+};
+```
+
+### KernelAssignment Struct
+
+A kernel assigned to a node after the matching pass.
+
+```rust
+pub struct KernelAssignment {
+    pub kernel_id: KernelId,
+    pub kernel_name: String,
+    pub dispatch: DispatchConfig,
+    pub path: ExecutionPath,
+}
+```
+
+**Example:**
+```rust
+let assignment = KernelAssignment {
+    kernel_id: KernelId(42),
+    kernel_name: "rms_norm_f16".to_string(),
+    dispatch: DispatchConfig {
+        grid: [
+            DispatchDim::CeilDiv { param: ParamName::SeqLen, divisor: 256 },
+            DispatchDim::Static(1),
+            DispatchDim::Static(1),
+        ],
+        threadgroup: [256, 1, 1],
+        shared_memory_bytes: 0,
+    },
+    path: ExecutionPath::Unified,
+};
+```
+
+### ExecutionPath Enum
+
+Execution path for ops that have prefill vs decode variants.
+
+```rust
+pub enum ExecutionPath {
+    Prefill,
+    Decode,
+    Unified,
+    Dual {
+        prefill_kernel: KernelId,
+        prefill_kernel_name: String,
+        prefill_dispatch: Box<DispatchConfig>,
+        decode_kernel: KernelId,
+        decode_kernel_name: String,
+        decode_dispatch: Box<DispatchConfig>,
+    },
+}
+```
+
+| Variant | Description |
+|---------|-------------|
+| `Prefill` | Only used during prefill (seq_len > 1) |
+| `Decode` | Only used during decode (seq_len = 1) |
+| `Unified` | Single kernel for both prefill and decode |
+| `Dual` | Separate kernels for prefill and decode |
+
+**Example:**
+```rust
+// Unified kernel (RMSNorm, activations)
+let unified = ExecutionPath::Unified;
+
+// Decode-only kernel (MatVec)
+let decode_only = ExecutionPath::Decode;
+
+// Dual path (MatMul for prefill, MatVec for decode)
+let dual = ExecutionPath::Dual {
+    prefill_kernel: KernelId(10),
+    prefill_kernel_name: "matmul_f16_prefill".to_string(),
+    prefill_dispatch: Box::new(DispatchConfig {
+        grid: [
+            DispatchDim::CeilDiv { param: ParamName::SeqLen, divisor: 64 },
+            DispatchDim::Static(64),
+            DispatchDim::Static(1),
+        ],
+        threadgroup: [64, 4, 1],
+        shared_memory_bytes: 8192,
+    }),
+    decode_kernel: KernelId(11),
+    decode_kernel_name: "matvec_f16_decode".to_string(),
+    decode_dispatch: Box::new(DispatchConfig {
+        grid: [
+            DispatchDim::Static(64),
+            DispatchDim::Static(1),
+            DispatchDim::Static(1),
+        ],
+        threadgroup: [256, 1, 1],
+        shared_memory_bytes: 0,
+    }),
+};
+```
+
+## Dispatch Configuration
+
+### DispatchConfig Struct
+
+GPU dispatch configuration.
+
+```rust
+pub struct DispatchConfig {
+    pub grid: [DispatchDim; 3],
+    pub threadgroup: [u32; 3],
+    pub shared_memory_bytes: u32,
+}
+```
+
+**Example:**
+```rust
+let dispatch = DispatchConfig {
+    grid: [
+        DispatchDim::CeilDiv { param: ParamName::SeqLen, divisor: 256 },
+        DispatchDim::Static(32),
+        DispatchDim::Static(1),
+    ],
+    threadgroup: [256, 1, 1],
+    shared_memory_bytes: 4096,
+};
+```
+
+### DispatchDim Enum
+
+A dispatch dimension that may depend on runtime parameters.
+
+```rust
+pub enum DispatchDim {
+    Static(u32),
+    CeilDiv { param: ParamName, divisor: u32 },
+    Expr(ParamExpr),
+}
+```
+
+| Variant | Description | Example |
+|---------|-------------|----------|
+| `Static(u32)` | Fixed grid dimension | `Static(64)` |
+| `CeilDiv { param, divisor }` | Ceiling division of runtime param | `CeilDiv { param: SeqLen, divisor: 256 }` → ⌈seq_len / 256⌉ |
+| `Expr(ParamExpr)` | Complex runtime expression | See `ParamExpr` below |
+
+**Example:**
+```rust
+// Static: 32 thread groups
+let static_dim = DispatchDim::Static(32);
+
+// Dynamic: ceil(seq_len / 256) thread groups
+let dynamic_dim = DispatchDim::CeilDiv {
+    param: ParamName::SeqLen,
+    divisor: 256,
+};
+
+// Complex expression
+let expr_dim = DispatchDim::Expr(ParamExpr::CeilDiv(
+    Box::new(ParamExpr::Mul(
+        Box::new(ParamExpr::Param(ParamName::SeqLen)),
+        Box::new(ParamExpr::Const(32)),
+    )),
+    Box::new(ParamExpr::Const(256)),
+));
+```
+
+### ParamExpr Enum
+
+Simple expression for runtime-computed dispatch dimensions.
+
+```rust
+pub enum ParamExpr {
+    Param(ParamName),
+    Const(u32),
+    CeilDiv(Box<ParamExpr>, Box<ParamExpr>),
+    Mul(Box<ParamExpr>, Box<ParamExpr>),
+    Add(Box<ParamExpr>, Box<ParamExpr>),
+    Min(Box<ParamExpr>, Box<ParamExpr>),
+}
+```
+
+**Example:**
+```rust
+// (seq_len + 255) / 256
+let expr = ParamExpr::CeilDiv(
+    Box::new(ParamExpr::Add(
+        Box::new(ParamExpr::Param(ParamName::SeqLen)),
+        Box::new(ParamExpr::Const(255)),
+    )),
+    Box::new(ParamExpr::Const(256)),
+);
+
+// min(seq_len, 8192)
+let bounded = ParamExpr::Min(
+    Box::new(ParamExpr::Param(ParamName::SeqLen)),
+    Box::new(ParamExpr::Const(8192)),
+);
+```
+
+## Graph Structure
+
+### CompGraph Struct
+
+The full computation graph for a model.
+
+```rust
+pub struct CompGraph {
+    pub nodes: Vec<Node>,
+    pub node_map: HashMap<NodeId, usize>,
+    pub tensors: HashMap<TensorId, TensorRef>,
+    pub inputs: Vec<TensorId>,
+    pub outputs: Vec<TensorId>,
+    pub metadata: GraphMetadata,
+
+    next_node_id: u32,
+    next_tensor_id: u32,
+}
+```
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `nodes` | `Vec<Node>` | All nodes in topological order |
+| `node_map` | `HashMap<NodeId, usize>` | Map from NodeId to index in `nodes` vector |
+| `tensors` | `HashMap<TensorId, TensorRef>` | All tensors in the graph |
+| `inputs` | `Vec<TensorId>` | Graph input tensors (e.g., input_ids, position_ids) |
+| `outputs` | `Vec<TensorId>` | Graph output tensors (e.g., logits) |
+| `metadata` | `GraphMetadata` | Model metadata |
+| `next_node_id` | `u32` | Next available node ID (private) |
+| `next_tensor_id` | `u32` | Next available tensor ID (private) |
+
+## Graph Metadata
+
+### GraphMetadata Struct
+
+Metadata about the compiled model.
+
+```rust
+pub struct GraphMetadata {
+    pub model_id: String,
+    pub architecture: ArchitectureFamily,
+    pub params: ModelParams,
+    pub weight_files: Vec<String>,
+    pub total_weight_bytes: usize,
+    pub tokenizer_path: Option<String>,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+    pub weight_file_paths: Vec<String>,
+    pub quant: String,
+}
+```
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `model_id` | `String` | HuggingFace model identifier |
+| `architecture` | `ArchitectureFamily` | Model architecture family |
+| `params` | `ModelParams` | Model hyperparameters |
+| `weight_files` | `Vec<String>` | Weight file names |
+| `total_weight_bytes` | `usize` | Total size of all weights |
+| `tokenizer_path` | `Option<String>` | Absolute path to tokenizer.json in HF cache |
+| `bos_token_id` | `Option<u32>` | BOS token id (1 for LLaMA/Mistral) |
+| `eos_token_id` | `Option<u32>` | EOS token id (generation stops at this token) |
+| `weight_file_paths` | `Vec<String>` | Absolute paths to .safetensors shards for mmap |
+| `quant` | `String` | Weight quantization format ("f16", "q8_0", "q4_0") |
+
+**Example:**
+```rust
+let metadata = GraphMetadata {
+    model_id: "meta-llama/Llama-3-8B".to_string(),
+    architecture: ArchitectureFamily::LLaMA,
+    params: ModelParams { /* ... */ },
+    weight_files: vec!["model.safetensors".to_string()],
+    total_weight_bytes: 16_000_000_000,
+    tokenizer_path: Some("/home/.cache/huggingface/hub/.../tokenizer.json".to_string()),
+    bos_token_id: Some(1),
+    eos_token_id: Some(2),
+    weight_file_paths: vec!["/path/to/model.safetensors".to_string()],
+    quant: "f16".to_string(),
+};
+```
+
+### ArchitectureFamily Enum
+
+Known model architecture families.
+
+```rust
+pub enum ArchitectureFamily {
+    LLaMA,
+    Mistral,
+    Qwen,
+    Phi,
+    Gemma,
+    GPTNeoX,
+}
+```
+
+| Architecture | Description | Examples |
+|--------------|-------------|----------|
+| `LLaMA` | Meta LLaMA family | LLaMA 2, LLaMA 3, CodeLLaMA |
+| `Mistral` | Mistral AI models | Mistral 7B, Mixtral |
+| `Qwen` | Alibaba Qwen models | Qwen, Qwen2, Qwen3 |
+| `Phi` | Microsoft Phi models | Phi-2, Phi-3 |
+| `Gemma` | Google Gemma models | Gemma 2B, Gemma 7B |
+| `GPTNeoX` | EleutherAI GPT-NeoX | Pythia, GPT-NeoX-20B |
+
+### ModelParams Struct
+
+Model parameters extracted from config.json.
+
+```rust
+pub struct ModelParams {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    pub max_position_embeddings: usize,
+    pub rms_norm_eps: f64,
+    pub rope_theta: f64,
+    pub rope_scaling: Option<RoPEScaling>,
+    pub attention_type: AttentionType,
+    pub ffn_type: FFNType,
+    pub tie_word_embeddings: bool,
+    pub qk_norm: bool,
+}
+```
+
+**Example (LLaMA 3 8B):**
+```rust
+let params = ModelParams {
+    hidden_size: 4096,
+    num_hidden_layers: 32,
+    num_attention_heads: 32,
+    num_kv_heads: 8,  // GQA
+    head_dim: 128,
+    intermediate_size: 14336,
+    vocab_size: 128256,
+    max_position_embeddings: 8192,
+    rms_norm_eps: 1e-5,
+    rope_theta: 500000.0,
+    rope_scaling: None,
+    attention_type: AttentionType::GQA,
+    ffn_type: FFNType::SwiGLU,
+    tie_word_embeddings: false,
+    qk_norm: false,
+};
+```
+
+### RoPEScaling Struct
+
+RoPE scaling configuration.
+
+```rust
+pub struct RoPEScaling {
+    pub scaling_type: String,
+    pub factor: f64,
+}
+```
+
+**Example:**
+```rust
+let rope_scaling = RoPEScaling {
+    scaling_type: "linear".to_string(),
+    factor: 2.0,
+};
+```
+
+### AttentionType Enum
+
+Attention mechanism variant.
+
+```rust
+pub enum AttentionType {
+    MHA,  // Multi-Head Attention
+    GQA,  // Grouped-Query Attention
+    MQA,  // Multi-Query Attention
+}
+```
+
+| Variant | Description | num_kv_heads |
+|---------|-------------|---------------|
+| `MHA` | Multi-Head Attention | = num_attention_heads |
+| `GQA` | Grouped-Query Attention | < num_attention_heads |
+| `MQA` | Multi-Query Attention | = 1 |
+
+### FFNType Enum
+
+Feed-forward network variant.
+
+```rust
+pub enum FFNType {
+    Standard,  // MLP with single linear layer
+    SwiGLU,    // Gated Linear Unit with SiLU
+    GeGLU,     // Gated Linear Unit with GELU
+}
+```
+
+## Graph Construction API
+
+### new()
+
+Create a new computation graph.
+
+```rust
+pub fn new(metadata: GraphMetadata) -> Self
+```
+
+**Example:**
+```rust
+let metadata = GraphMetadata {
+    model_id: "meta-llama/Llama-3-8B".to_string(),
+    architecture: ArchitectureFamily::LLaMA,
+    params: ModelParams { /* ... */ },
+    weight_files: vec!["model.safetensors".to_string()],
+    total_weight_bytes: 16_000_000_000,
+    tokenizer_path: None,
+    bos_token_id: Some(1),
+    eos_token_id: Some(2),
+    weight_file_paths: vec![],
+    quant: "f16".to_string(),
+};
+
+let mut graph = CompGraph::new(metadata);
+```
+
+### new_tensor()
+
+Create a new tensor and register it in the graph.
+
+```rust
+pub fn new_tensor(
+    &mut self,
+    shape: Shape,
+    dtype: DType,
+    storage: StorageClass
+) -> TensorId
+```
+
+**Example:**
+```rust
+// Create input tensor: [1, seq, hidden]
+let input_tensor = graph.new_tensor(
+    Shape(vec![
+        Dim::Static(1),
+        Dim::Param(ParamDim {
+            name: ParamName::SeqLen,
+            min: 1,
+            max: 8192,
+            alignment: 1,
+        }),
+        Dim::Static(4096),
+    ]),
+    DType::F16,
+    StorageClass::Activation { buffer: None },
+);
+```
+
+### add_node()
+
+Add a node to the graph.
+
+```rust
+pub fn add_node(
+    &mut self,
+    op: Op,
+    inputs: Vec<TensorId>,
+    output: TensorId,
+    attrs: AttrMap,
+) -> NodeId
+```
+
+**Example:**
+```rust
+// Add RMSNorm node
+let node_id = graph.add_node(
+    Op::RMSNorm { eps: 1e-5 },
+    vec![input_tensor, weight_tensor],
+    output_tensor,
+    HashMap::new(),
+);
+```
+
+### add_node_multi_out()
+
+Add a node with multiple outputs (e.g., Split).
+
+```rust
+pub fn add_node_multi_out(
+    &mut self,
+    op: Op,
+    inputs: Vec<TensorId>,
+    output: TensorId,
+    extra_outputs: Vec<TensorId>,
+    attrs: AttrMap,
+) -> NodeId
+```
+
+**Example:**
+```rust
+// Split QKV projection into Q, K, V
+let split_node = graph.add_node_multi_out(
+    Op::Split {
+        axis: 2,
+        sizes: vec![4096, 512, 512],
+    },
+    vec![qkv_tensor],
+    q_tensor,
+    vec![k_tensor, v_tensor],
+    HashMap::new(),
+);
+```
+
+## Graph Traversal and Analysis
+
+### tensor()
+
+Get a tensor by ID.
+
+```rust
+pub fn tensor(&self, id: TensorId) -> &TensorRef
+```
+
+**Example:**
+```rust
+let t = graph.tensor(TensorId(0));
+println!("Tensor shape: {}", t.shape);
+```
+
+### tensor_mut()
+
+Get a mutable tensor by ID.
+
+```rust
+pub fn tensor_mut(&mut self, id: TensorId) -> &mut TensorRef
+```
+
+### node()
+
+Get a node by ID.
+
+```rust
+pub fn node(&self, id: NodeId) -> &Node
+```
+
+**Example:**
+```rust
+let node = graph.node(NodeId(0));
+println!("Op: {:?}", node.op);
+```
+
+### node_mut()
+
+Get a mutable node by ID.
+
+```rust
+pub fn node_mut(&mut self, id: NodeId) -> &mut Node
+```
+
+### topo_iter()
+
+Iterate nodes in topological order.
+
+```rust
+pub fn topo_iter(&self) -> impl Iterator<Item = &Node>
+```
+
+**Example:**
+```rust
+for node in graph.topo_iter() {
+    println!("Node {}: {:?}", node.id.0, node.op);
+}
+```
+
+### num_nodes()
+
+Get the total number of nodes.
+
+```rust
+pub fn num_nodes(&self) -> usize
+```
+
+### num_compute_ops()
+
+Get the number of compute-bound operations.
+
+```rust
+pub fn num_compute_ops(&self) -> usize
+```
+
+**Example:**
+```rust
+let total = graph.num_nodes();
+let compute = graph.num_compute_ops();
+println!("Compute ops: {}/{}", compute, total);
+```
+
+## Real-World Examples
+
+### Building a Simple Graph
+
+```rust
+use std::collections::HashMap;
+
+// Create graph
+let metadata = GraphMetadata {
+    model_id: "test-model".to_string(),
+    architecture: ArchitectureFamily::LLaMA,
+    params: ModelParams { /* ... */ },
+    weight_files: vec![],
+    total_weight_bytes: 0,
+    tokenizer_path: None,
+    bos_token_id: Some(1),
+    eos_token_id: Some(2),
+    weight_file_paths: vec![],
+    quant: "f16".to_string(),
+};
+
+let mut graph = CompGraph::new(metadata);
+
+// Create tensors
+let input = graph.new_tensor(
+    Shape(vec![Dim::Static(1), Dim::Static(128), Dim::Static(4096)]),
+    DType::F16,
+    StorageClass::Activation { buffer: None },
+);
+
+let weight = graph.new_tensor(
+    Shape(vec![Dim::Static(4096)]),
+    DType::F16,
+    StorageClass::Weight(WeightBinding {
+        name: "norm.weight".to_string(),
+        byte_offset: 0,
+        byte_size: 4096 * 2,
+        file_shape: vec![4096],
+        file_dtype: DType::F16,
+    }),
+);
+
+let output = graph.new_tensor(
+    Shape(vec![Dim::Static(1), Dim::Static(128), Dim::Static(4096)]),
+    DType::F16,
+    StorageClass::Activation { buffer: None },
+);
+
+// Add node
+let node_id = graph.add_node(
+    Op::RMSNorm { eps: 1e-5 },
+    vec![input, weight],
+    output,
+    HashMap::new(),
+);
+
+// Set graph inputs/outputs
+graph.inputs = vec![input];
+graph.outputs = vec![output];
+
+println!("Graph has {} nodes", graph.num_nodes());
+```
+
+### Analyzing Graph Statistics
+
+```rust
+// Count operation types
+let mut op_counts = HashMap::new();
+for node in graph.topo_iter() {
+    let op_name = format!("{:?}", node.op);
+    *op_counts.entry(op_name).or_insert(0) += 1;
+}
+
+println!("Operation counts:");
+for (op, count) in op_counts {
+    println!("  {}: {}", op, count);
+}
+
+// Compute performance estimate
+let total_cost: f64 = graph.topo_iter()
+    .filter_map(|n| n.estimated_cost)
+    .sum();
+println!("Estimated total cost: {:.2} ms", total_cost / 1000.0);
+
+// Analyze memory usage
+let total_activations: usize = graph.tensors.values()
+    .filter(|t| matches!(t.storage, StorageClass::Activation { .. }))
+    .map(|t| t.max_size_bytes())
+    .sum();
+println!("Peak activation memory: {} MB", total_activations / (1024 * 1024));
+```
+
+### Walking the Graph
+
+```rust
+// Print graph in execution order
+for (idx, node) in graph.topo_iter().enumerate() {
+    println!("Step {}: {:?}", idx, node.op);
+    
+    // Print inputs
+    for input_id in &node.inputs {
+        let tensor = graph.tensor(*input_id);
+        println!("  Input: {} {} bytes",
+            tensor.shape,
+            tensor.max_size_bytes(),
+        );
+    }
+    
+    // Print output
+    let output = graph.tensor(node.output);
+    println!("  Output: {} {} bytes",
+        output.shape,
+        output.max_size_bytes(),
+    );
+    
+    // Print kernel assignment
+    if let Some(kernel) = &node.kernel {
+        println!("  Kernel: {}", kernel.kernel_name);
+    }
+}
+```
+
+## See Also
+
+- [IR Operations](/api/ir/ops) - Available operations
+- [IR Types](/api/ir/types) - Type system and tensor representation

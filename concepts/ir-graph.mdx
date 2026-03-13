@@ -1,0 +1,665 @@
+---
+title: 'IR Graph'
+description: 'The intermediate representation: hardware-agnostic tensor operations'
+---
+
+## Overview
+
+The UNC IR (Intermediate Representation) is a typed tensor graph that represents model computation at the ideal abstraction level: above individual arithmetic operations but below high-level transformer blocks. This design enables powerful pattern matching for optimization while remaining hardware-agnostic.
+
+## Design Philosophy
+
+### Abstraction Level
+
+The IR lives at the **right level** for compiler optimization:
+
+**Too Low** (LLVM-style):
+```
+mul x0, w0, w1
+add x2, x0, w2
+...
+```
+❌ Pattern matching is hard, optimization opportunities are obscured
+
+**Too High** (Framework-style):
+```
+TransformerBlock(x, weights)
+```
+❌ Can't optimize internal structure, limited fusion opportunities
+
+**Just Right** (UNC IR):
+```rust
+RMSNorm(x, weight, eps=1e-5) → x_norm
+MatMul(x_norm, W_q) → q
+MatMul(x_norm, W_k) → k
+MatMul(x_norm, W_v) → v
+RoPE(q, base=10000) → q_rope
+RoPE(k, base=10000) → k_rope
+ScaledDotProductAttention(q_rope, k_rope, v) → attn_out
+```
+✅ Clear pattern matching, each op maps to 1+ GPU kernels, fusion opportunities visible
+
+### Hardware Agnostic
+
+The same IR graph can target multiple backends:
+- **Metal** (current): Apple Silicon GPUs
+- **CUDA** (planned): NVIDIA GPUs
+- **ROCm** (planned): AMD GPUs
+- **WASM** (planned): WebGPU in browsers
+- **CPU** (planned): Intel oneDNN, ARM NEON
+
+Backend-specific optimizations happen during code generation, not in the IR.
+
+## IR Operations
+
+**File**: `src/ir/ops.rs`
+
+### Matrix Operations
+
+```rust
+pub enum Op {
+    // Standard matrix multiply
+    MatMul,
+
+    // Batch matrix multiply with optional transpose
+    BatchMatMul { transpose_b: bool },
+
+    // Matrix-vector multiply (decode-optimized)
+    MatVec,
+
+    // Quantized variants
+    QuantizedMatMul { weight_dtype: DType },
+    QuantizedMatVec { weight_dtype: DType },
+    // ...
+}
+```
+
+**Usage**:
+```rust
+// Attention Q projection: [seq, hidden] × [hidden, num_heads*head_dim] → [seq, num_heads*head_dim]
+Op::MatMul
+
+// Quantized decode GEMV: [1, hidden] × [hidden, dim]_Q4_0 → [1, dim]
+Op::QuantizedMatVec { weight_dtype: DType::Q4_0 }
+```
+
+### Normalization Operations
+
+```rust
+pub enum Op {
+    // RMS normalization (LLaMA-style)
+    RMSNorm { eps: f32 },
+
+    // Layer normalization (GPT-style)
+    LayerNorm { eps: f32 },
+
+    // Per-head QK normalization (Qwen3)
+    QKNorm { eps: f32, num_heads: usize, head_dim: usize },
+    // ...
+}
+```
+
+**RMSNorm Formula**:
+```
+rms = sqrt(mean(x²) + eps)
+y = (x / rms) * weight
+```
+
+**QKNorm** (Qwen3-specific):
+- Normalizes each `head_dim`-sized chunk independently
+- Shared weight vector of length `head_dim`
+- Applied to Q and K projections before RoPE
+
+### Attention Operations
+
+```rust
+pub enum Op {
+    // Rotary position embedding
+    RoPE { base: f64, interleaved: bool },
+
+    // Fused scaled dot-product attention
+    ScaledDotProductAttention {
+        causal: bool,          // Causal masking (decoder-only)
+        gqa_factor: usize,     // Grouped-query attention factor
+        head_dim: usize,       // Dimension per head
+        scale: f32,            // 1/sqrt(head_dim)
+        has_mask: bool,        // Explicit attention mask
+        has_sinks: bool,       // Sink tokens (attend to all)
+    },
+
+    // KV cache append (in-place update)
+    KVCacheAppend {
+        layer: usize,
+        role: KVRole,  // Key or Value
+    },
+    // ...
+}
+```
+
+**RoPE** (Rotary Position Embedding):
+```python
+# Complex number rotation in frequency space
+q[pos, pair] = q[pos, pair] * exp(i * theta * pos)
+  where theta = 1 / (base^(2*pair / head_dim))
+
+# Implemented as:
+cos_theta = cos(theta * pos)
+sin_theta = sin(theta * pos)
+q_rotated = [q_even * cos - q_odd * sin, q_odd * cos + q_even * sin]
+```
+
+**ScaledDotProductAttention**:
+```python
+# Standard formulation
+scores = (Q @ K.T) / sqrt(head_dim)
+if causal:
+    scores = mask_upper_triangle(scores, -inf)
+attn_weights = softmax(scores, dim=-1)
+out = attn_weights @ V
+```
+
+**KVCacheAppend**:
+- In-place update of pre-allocated KV cache
+- Cache layout: `[num_layers, num_kv_heads, max_seq_len, head_dim]`
+- Append at position `current_pos` in decode loop
+
+### Activation Functions
+
+```rust
+pub enum Op {
+    SiLU,   // Swish: x * sigmoid(x)
+    GELU,   // Gaussian Error Linear Unit
+    ReLU,   // Rectified Linear Unit
+    // ...
+}
+```
+
+**SiLU** (used in LLaMA FFN):
+```
+SiLU(x) = x * σ(x) = x / (1 + e^(-x))
+```
+
+### Elementwise Operations
+
+```rust
+pub enum Op {
+    Mul,                 // Element-wise multiply
+    Add,                 // Element-wise add (residual connections)
+    Scale { factor: f32 }, // Multiply by scalar
+    // ...
+}
+```
+
+### Memory Operations
+
+```rust
+pub enum Op {
+    Gather { axis: usize },              // Embedding lookup
+    Reshape { target_shape: Vec<i64> },  // View tensor as different shape
+    Transpose { perm: Vec<usize> },      // Permute dimensions
+    Concatenate { axis: usize },         // Concat multiple tensors
+    Split { axis: usize, sizes: Vec<usize> }, // Split into multiple tensors
+    // ...
+}
+```
+
+**Gather** (embedding lookup):
+```rust
+// Input: token_ids [seq_len], embed_table [vocab_size, hidden_size]
+// Output: embeddings [seq_len, hidden_size]
+Op::Gather { axis: 0 }
+```
+
+### Fused Operations
+
+Created by optimization passes:
+
+```rust
+pub enum FusionPattern {
+    // RMSNorm followed by Linear projection
+    RMSNormLinear,
+
+    // SwiGLU: SiLU(gate) * up
+    SwiGLU,
+
+    // Fused Q/K/V projections
+    QKVProjection { q_size: usize, k_size: usize, v_size: usize },
+
+    // Linear + activation (MatMul + SiLU/GELU/ReLU)
+    LinearActivation { activation: ActivationType, has_bias: bool },
+
+    // Linear + residual add
+    LinearResidualAdd,
+
+    // Custom named fusion
+    Custom { name: String, ops: Vec<String> },
+}
+
+pub enum Op {
+    Fused(FusionPattern),
+    // ...
+}
+```
+
+## Type System
+
+**File**: `src/ir/types.rs`
+
+### Data Types
+
+```rust
+pub enum DType {
+    // Floating point
+    F32,
+    F16,
+    BF16,
+
+    // Quantized (block-structured)
+    Q8_0,   // 8-bit: 32 elements/block, 1×f16 scale
+    Q4_0,   // 4-bit: 32 elements/block, 1×f16 scale (symmetric)
+    Q4_1,   // 4-bit: 32 elements/block, f16 scale + f16 min
+
+    // Integer types
+    I32,
+    U32,
+    Bool,
+}
+```
+
+**Quantization Format** (Q4_0):
+```c
+struct block_q4_0 {
+    half  scale;        // Quantization scale
+    uint8_t qs[16];     // 32 × 4-bit values packed into 16 bytes
+};
+
+// Dequantization:
+for (int i = 0; i < 32; i++) {
+    int8_t q = extract_4bit(qs, i);  // Signed 4-bit [-8, 7]
+    float x = scale * (float)q;
+}
+```
+
+**Block Size**: 32 elements per quantization block
+- Q8_0: 34 bytes/block → 1.0625 bytes/element
+- Q4_0: 18 bytes/block → 0.5625 bytes/element
+- Compared to F16: 2 bytes/element
+
+**Compression Ratios**:
+- Q8_0: 1.88x vs F16
+- Q4_0: 3.56x vs F16
+
+### Tensor Shapes
+
+```rust
+pub enum Dim {
+    // Fully resolved at compile time
+    Static(usize),
+
+    // Runtime parameter with bounds
+    Param(ParamDim),
+}
+
+pub struct ParamDim {
+    pub name: ParamName,
+    pub min: usize,       // Minimum value (decode: 1)
+    pub max: usize,       // Maximum value (prefill: 8192)
+    pub alignment: usize, // Required alignment (e.g., 8 for SIMD)
+}
+
+pub enum ParamName {
+    SeqLen,        // Current sequence length
+    TotalSeqLen,   // seq_len + kv_cache_len (for attention)
+    BatchSize,     // Batch dimension (currently always 1)
+}
+
+pub struct Shape(pub Vec<Dim>);
+```
+
+**Key Invariant**: Weight dimensions are always `Static`, activation dimensions may be `Param`
+
+**Example Shapes**:
+```rust
+// Token IDs input: [seq_len]
+Shape(vec![Dim::Param(ParamDim { name: SeqLen, min: 1, max: 8192 })])
+
+// Weight matrix: [4096, 4096]
+Shape(vec![Dim::Static(4096), Dim::Static(4096)])
+
+// Attention output: [seq_len, hidden_size]
+Shape(vec![
+    Dim::Param(ParamDim { name: SeqLen, min: 1, max: 8192 }),
+    Dim::Static(4096),
+])
+```
+
+**Memory Allocation**:
+- Compiler allocates for `max` dimension
+- Runtime dispatches for actual dimension
+- Example: `[seq, 4096]` tensor allocates `8192 * 4096 * 2` bytes, but only uses `seq * 4096 * 2` bytes
+
+### Storage Classes
+
+```rust
+pub enum StorageClass {
+    // Model weight: mmap'd from safetensors
+    Weight(WeightBinding),
+
+    // Activation: runtime-computed, reusable buffer
+    Activation { buffer: Option<BufferId> },
+
+    // KV cache: persistent across decode steps
+    KVCache { layer: usize, head_group: usize, role: KVRole },
+
+    // Compile-time constant (e.g., RoPE frequency table)
+    Constant { data: Vec<u8> },
+}
+
+pub struct WeightBinding {
+    pub name: String,           // Tensor name in safetensors
+    pub byte_offset: usize,     // Offset in weight file
+    pub byte_size: usize,       // Size in bytes
+    pub file_shape: Vec<usize>, // Original shape
+    pub file_dtype: DType,      // Original dtype (BF16/F16)
+}
+```
+
+**Weight Binding**:
+- Maps IR weight tensor to specific location in safetensors file
+- Resolved by `WeightBindingResolution` pass
+- Runtime: mmap safetensors, access via byte offset (zero-copy)
+
+**Activation Buffer**:
+- Reusable scratch space for intermediate tensors
+- Memory planner assigns `BufferId` based on liveness analysis
+- Buffers are aliased when lifetimes don't overlap
+
+**KV Cache**:
+- Pre-allocated for `max_seq_len`
+- Persistent across decode loop
+- Layout: `[num_layers, num_kv_heads, max_seq_len, head_dim]`
+- Updated in-place by `KVCacheAppend` operation
+
+## Graph Structure
+
+**File**: `src/ir/graph.rs`
+
+```rust
+pub struct CompGraph {
+    pub nodes: Vec<Node>,                      // Operations in topological order
+    pub node_map: HashMap<NodeId, usize>,      // Fast node lookup
+    pub tensors: HashMap<TensorId, TensorRef>, // All tensors
+    pub inputs: Vec<TensorId>,                 // Graph inputs (token_ids)
+    pub outputs: Vec<TensorId>,                // Graph outputs (logits)
+    pub metadata: GraphMetadata,               // Model info
+}
+
+pub struct Node {
+    pub id: NodeId,
+    pub op: Op,                               // Operation type
+    pub inputs: Vec<TensorId>,                // Input tensor IDs
+    pub output: TensorId,                     // Primary output
+    pub extra_outputs: Vec<TensorId>,         // Additional outputs (e.g., Split)
+    pub attrs: AttrMap,                       // Op-specific attributes
+    pub kernel: Option<KernelAssignment>,     // Assigned Metal kernel
+    pub estimated_cost: Option<f64>,          // FLOP estimate
+}
+
+pub struct TensorRef {
+    pub id: TensorId,
+    pub shape: Shape,
+    pub dtype: DType,
+    pub storage: StorageClass,
+    pub strides: Option<Vec<usize>>,          // Memory layout (None = row-major)
+}
+```
+
+### Graph Metadata
+
+```rust
+pub struct GraphMetadata {
+    pub model_id: String,                     // HuggingFace model ID
+    pub architecture: ArchitectureFamily,     // LLaMA, Mistral, etc.
+    pub params: ModelParams,                  // Model hyperparameters
+    pub weight_files: Vec<String>,            // Safetensors file paths
+    pub total_weight_bytes: usize,
+    pub tokenizer_path: Option<String>,       // tokenizer.json path
+    pub bos_token_id: Option<u32>,            // Beginning-of-sequence token
+    pub eos_token_id: Option<u32>,            // End-of-sequence token
+    pub weight_file_paths: Vec<String>,       // Absolute paths for runtime mmap
+    pub quant: String,                        // Quantization format ("f16", "q4_0", etc.)
+}
+
+pub struct ModelParams {
+    pub hidden_size: usize,                   // e.g., 4096
+    pub num_hidden_layers: usize,             // e.g., 32
+    pub num_attention_heads: usize,           // e.g., 32
+    pub num_kv_heads: usize,                  // e.g., 8 (GQA)
+    pub head_dim: usize,                      // e.g., 128
+    pub intermediate_size: usize,             // FFN hidden size, e.g., 14336
+    pub vocab_size: usize,                    // e.g., 32000
+    pub max_position_embeddings: usize,       // e.g., 8192
+    pub rms_norm_eps: f64,                    // e.g., 1e-5
+    pub rope_theta: f64,                      // e.g., 10000.0
+    pub attention_type: AttentionType,        // MHA, GQA, or MQA
+    pub ffn_type: FFNType,                    // Standard or SwiGLU
+    pub tie_word_embeddings: bool,            // Share input/output embeddings
+    pub qk_norm: bool,                        // Per-head QK norm (Qwen3)
+}
+```
+
+### Kernel Assignment
+
+```rust
+pub struct KernelAssignment {
+    pub kernel_id: KernelId,
+    pub kernel_name: String,                  // Metal function name
+    pub dispatch: DispatchConfig,             // GPU dispatch parameters
+    pub path: ExecutionPath,                  // Prefill/Decode branching
+}
+
+pub enum ExecutionPath {
+    Prefill,      // Only used during prefill (seq_len > 1)
+    Decode,       // Only used during decode (seq_len = 1)
+    Unified,      // Single kernel for both
+    Dual {        // Runtime branch based on seq_len
+        prefill_kernel: KernelId,
+        prefill_kernel_name: String,
+        prefill_dispatch: Box<DispatchConfig>,
+        decode_kernel: KernelId,
+        decode_kernel_name: String,
+        decode_dispatch: Box<DispatchConfig>,
+    },
+}
+
+pub struct DispatchConfig {
+    pub grid: [DispatchDim; 3],              // Threadgroups (X, Y, Z)
+    pub threadgroup: [u32; 3],               // Threads per threadgroup
+    pub shared_memory_bytes: u32,            // Threadgroup shared memory
+}
+
+pub enum DispatchDim {
+    Static(u32),                             // Compile-time constant
+    CeilDiv { param: ParamName, divisor: u32 }, // ⌈param / divisor⌉
+    Expr(ParamExpr),                         // Complex runtime expression
+}
+```
+
+**Example**: GEMV kernel for Q projection in decode
+```rust
+KernelAssignment {
+    kernel_name: "gemv_f16".to_string(),
+    dispatch: DispatchConfig {
+        grid: [DispatchDim::CeilDiv { param: ParamName::SeqLen, divisor: 16 }, 1, 1],
+        threadgroup: [256, 1, 1],
+        shared_memory_bytes: 0,
+    },
+    path: ExecutionPath::Decode,
+}
+```
+
+## Graph Construction
+
+### Template-Based Lowering
+
+**Example**: LLaMA attention block (`src/frontend/templates/llama.rs`)
+
+```rust
+let p = params;
+
+// Input: x [seq, hidden]
+let x_tid = /* ... */;
+
+// Pre-attention RMSNorm
+let norm_weight = graph.weight(
+    &format!("model.layers.{layer}.input_layernorm.weight"),
+    &[p.hidden_size],
+    DType::F16,
+);
+let x_norm = graph.new_tensor(
+    Shape(vec![seq_dim, Dim::Static(p.hidden_size)]),
+    DType::F16,
+    StorageClass::Activation { buffer: None },
+);
+graph.add_node(
+    Op::RMSNorm { eps: p.rms_norm_eps as f32 },
+    vec![x_tid, norm_weight],
+    x_norm,
+    HashMap::new(),
+);
+
+// Q/K/V projections
+let wq = graph.weight(&format!("model.layers.{layer}.self_attn.q_proj.weight"), ...);
+let wk = graph.weight(&format!("model.layers.{layer}.self_attn.k_proj.weight"), ...);
+let wv = graph.weight(&format!("model.layers.{layer}.self_attn.v_proj.weight"), ...);
+
+let q = graph.new_tensor(Shape(vec![seq_dim, Dim::Static(p.num_attention_heads * p.head_dim)]), ...);
+let k = graph.new_tensor(Shape(vec![seq_dim, Dim::Static(p.num_kv_heads * p.head_dim)]), ...);
+let v = graph.new_tensor(Shape(vec![seq_dim, Dim::Static(p.num_kv_heads * p.head_dim)]), ...);
+
+graph.add_node(Op::MatMul, vec![x_norm, wq], q, HashMap::new());
+graph.add_node(Op::MatMul, vec![x_norm, wk], k, HashMap::new());
+graph.add_node(Op::MatMul, vec![x_norm, wv], v, HashMap::new());
+
+// RoPE
+let q_rope = graph.new_tensor(...);
+let k_rope = graph.new_tensor(...);
+graph.add_node(Op::RoPE { base: p.rope_theta, interleaved: false }, vec![q], q_rope, ...);
+graph.add_node(Op::RoPE { base: p.rope_theta, interleaved: false }, vec![k], k_rope, ...);
+
+// KV cache append
+let k_cache = graph.new_tensor(..., StorageClass::KVCache { layer, head_group: 0, role: Key });
+let v_cache = graph.new_tensor(..., StorageClass::KVCache { layer, head_group: 0, role: Value });
+graph.add_node(Op::KVCacheAppend { layer, role: Key }, vec![k_rope], k_cache, ...);
+graph.add_node(Op::KVCacheAppend { layer, role: Value }, vec![v], v_cache, ...);
+
+// SDPA
+let attn_out = graph.new_tensor(...);
+graph.add_node(
+    Op::ScaledDotProductAttention {
+        causal: true,
+        gqa_factor: p.num_attention_heads / p.num_kv_heads,
+        head_dim: p.head_dim,
+        scale: 1.0 / (p.head_dim as f32).sqrt(),
+        has_mask: false,
+        has_sinks: false,
+    },
+    vec![q_rope, k_cache, v_cache],
+    attn_out,
+    HashMap::new(),
+);
+
+// Output projection
+let wo = graph.weight(&format!("model.layers.{layer}.self_attn.o_proj.weight"), ...);
+let attn_proj = graph.new_tensor(...);
+graph.add_node(Op::MatMul, vec![attn_out, wo], attn_proj, ...);
+
+// Residual connection
+let x_residual = graph.new_tensor(...);
+graph.add_node(Op::Add, vec![x_tid, attn_proj], x_residual, ...);
+```
+
+## Graph Validation
+
+The compiler validates:
+1. **Shape compatibility**: Input/output shapes match op requirements
+2. **Type compatibility**: DTypes are compatible (e.g., no f16 + i32)
+3. **Topological ordering**: All inputs are produced before use
+4. **Storage class validity**: Weights are Static dims, activations may be Param
+5. **KV cache correctness**: Layer indices match, K/V pairs exist
+
+## Graph Optimization
+
+Optimization passes transform the graph:
+
+1. **Pattern matching**: Identify fusible subgraphs
+   ```
+   Add(x, y) → z
+   RMSNorm(z) → z_norm
+   ```
+   Becomes:
+   ```
+   Fused(AddRMSNorm)(x, y) → z_norm
+   ```
+
+2. **Dead code elimination**: Remove nodes that don't contribute to outputs
+
+3. **Constant folding**: Evaluate compile-time constants (e.g., RoPE frequency table)
+
+4. **Layout optimization**: Transpose tensors to match kernel requirements
+
+See [Compiler Pipeline](/concepts/compiler-pipeline) for details.
+
+## Example: Full Graph
+
+**TinyLlama 1.1B (simplified)**:
+
+```
+Graph: 1,243 nodes, 2,156 tensors
+
+Inputs: [token_ids]
+Outputs: [logits]
+
+Nodes:
+  0: Gather(embed_table, token_ids) → x [seq, 2048]
+  
+  # Layer 0 attention
+  1: RMSNorm(x, norm_w_0) → x_norm [seq, 2048]
+  2: MatMul(x_norm, Wq_0) → q [seq, 2048]
+  3: MatMul(x_norm, Wk_0) → k [seq, 2048]
+  4: MatMul(x_norm, Wv_0) → v [seq, 2048]
+  5: RoPE(q) → q_rope [seq, 2048]
+  6: RoPE(k) → k_rope [seq, 2048]
+  7: KVCacheAppend(k_rope, layer=0, Key) → k_cache [2048, 8192]
+  8: KVCacheAppend(v, layer=0, Value) → v_cache [2048, 8192]
+  9: SDPA(q_rope, k_cache, v_cache) → attn_out [seq, 2048]
+  10: MatMul(attn_out, Wo_0) → attn_proj [seq, 2048]
+  11: Add(x, attn_proj) → x_residual [seq, 2048]
+  
+  # Layer 0 FFN
+  12: RMSNorm(x_residual, post_norm_w_0) → x_norm [seq, 2048]
+  13: MatMul(x_norm, W_gate_0) → gate [seq, 5632]
+  14: MatMul(x_norm, W_up_0) → up [seq, 5632]
+  15: SiLU(gate) → gate_act [seq, 5632]
+  16: Mul(gate_act, up) → ffn_hidden [seq, 5632]  # SwiGLU
+  17: MatMul(ffn_hidden, W_down_0) → ffn_out [seq, 2048]
+  18: Add(x_residual, ffn_out) → x [seq, 2048]
+  
+  # ... repeat for layers 1-21 ...
+  
+  # Final
+  1241: RMSNorm(x, final_norm_w) → x_norm [seq, 2048]
+  1242: MatMul(x_norm, lm_head_w) → logits [seq, 32000]
+```
+
+**After optimization**: 412 nodes (67% reduction)
+- QKV fusion: 3 MatMuls → 1 Fused(QKVProjection)
+- Add+RMSNorm fusion: 2 ops → 1 Fused(AddRMSNorm)
+- SwiGLU fusion: SiLU + Mul → 1 Fused(SwiGLU)
+- Dead code elimination: Remove unused intermediate tensors
+
+## Related Documentation
+
+- [Architecture Overview](/concepts/architecture) - High-level system design
+- [Compiler Pipeline](/concepts/compiler-pipeline) - Optimization passes
+- [Output Modes](/concepts/output-modes) - Runtime execution

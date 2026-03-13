@@ -1,0 +1,417 @@
+---
+title: 'IR Module'
+description: 'Intermediate representation: computation graphs, operations, and type system'
+---
+
+The IR (Intermediate Representation) module defines UNC's computation graph, operation types, and type system.
+
+## Overview
+
+The IR provides:
+- `CompGraph` - Directed acyclic graph of operations
+- `Op` enum - All supported operations (MatMul, RMSNorm, Attention, etc.)
+- Type system with static and runtime-parameterized dimensions
+- Graph metadata (architecture, model parameters)
+
+## CompGraph
+
+The full computation graph for a model.
+
+```rust
+pub struct CompGraph {
+    pub nodes: Vec<Node>,
+    pub tensors: HashMap<TensorId, TensorRef>,
+    pub inputs: Vec<TensorId>,
+    pub outputs: Vec<TensorId>,
+    pub metadata: GraphMetadata,
+}
+```
+
+### Constructor
+
+<ParamField path="CompGraph::new(metadata)" type="Self">
+  Creates an empty graph with the given metadata.
+  
+  **Parameters:**
+  - `metadata: GraphMetadata` - Model information and parameters
+</ParamField>
+
+### Methods
+
+<ParamField path="new_tensor(shape, dtype, storage)" type="TensorId">
+  Creates and registers a new tensor in the graph.
+  
+  **Parameters:**
+  - `shape: Shape` - Tensor shape (may contain runtime parameters)
+  - `dtype: DType` - Data type (F16, F32, U32, etc.)
+  - `storage: StorageClass` - Weight, Activation, or KVCache
+  
+  **Returns:** Unique tensor identifier
+</ParamField>
+
+<ParamField path="add_node(op, inputs, output, attrs)" type="NodeId">
+  Adds an operation node to the graph.
+  
+  **Parameters:**
+  - `op: Op` - Operation type
+  - `inputs: Vec<TensorId>` - Input tensor IDs
+  - `output: TensorId` - Output tensor ID
+  - `attrs: AttrMap` - Additional attributes (HashMap&lt;String, AttrValue&gt;)
+  
+  **Returns:** Unique node identifier
+</ParamField>
+
+<ParamField path="tensor(id)" type="&TensorRef">
+  Retrieves a tensor by ID.
+</ParamField>
+
+<ParamField path="node(id)" type="&Node">
+  Retrieves a node by ID.
+</ParamField>
+
+<ParamField path="topo_iter()" type="impl Iterator<Item = &Node>">
+  Iterates nodes in topological order.
+</ParamField>
+
+<ParamField path="num_nodes()" type="usize">
+  Returns the total number of nodes.
+</ParamField>
+
+<ParamField path="num_compute_ops()" type="usize">
+  Returns the number of compute-bound operations (matmuls, attention).
+</ParamField>
+
+### Node Structure
+
+```rust
+pub struct Node {
+    pub id: NodeId,
+    pub op: Op,
+    pub inputs: Vec<TensorId>,
+    pub output: TensorId,
+    pub kernel: Option<KernelAssignment>,
+    pub estimated_cost: Option<f64>,
+}
+```
+
+After kernel matching, each node gets a `KernelAssignment` with:
+- `kernel_id: KernelId` - Matched kernel from registry
+- `kernel_name: String` - Kernel function name
+- `dispatch: DispatchConfig` - GPU dispatch configuration (grid, threadgroup)
+- `path: ExecutionPath` - Prefill, Decode, or Dual
+
+### GraphMetadata
+
+```rust
+pub struct GraphMetadata {
+    pub model_id: String,
+    pub architecture: ArchitectureFamily,
+    pub params: ModelParams,
+    pub weight_files: Vec<String>,
+    pub total_weight_bytes: usize,
+    pub tokenizer_path: Option<String>,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+    pub weight_file_paths: Vec<String>,
+    pub quant: String,
+}
+```
+
+### Usage Example
+
+```rust
+use unc::ir::graph::{CompGraph, GraphMetadata, ModelParams, ArchitectureFamily};
+use unc::ir::ops::Op;
+use unc::ir::types::{Shape, Dim, DType, StorageClass};
+
+// Create metadata
+let metadata = GraphMetadata {
+    model_id: "test-model".to_string(),
+    architecture: ArchitectureFamily::LLaMA,
+    params: ModelParams { /* ... */ },
+    // ... other fields
+};
+
+// Create graph
+let mut graph = CompGraph::new(metadata);
+
+// Add tensors
+let weight_shape = Shape(vec![Dim::Static(4096), Dim::Static(4096)]);
+let weight = graph.new_tensor(
+    weight_shape,
+    DType::F16,
+    StorageClass::Weight(WeightBinding {
+        name: "layer.0.weight".to_string(),
+        byte_offset: 0,
+        byte_size: 4096 * 4096 * 2,
+        file_shape: vec![4096, 4096],
+        file_dtype: DType::F16,
+    }),
+);
+
+let seq_len = Dim::Param(ParamDim {
+    name: ParamName::SeqLen,
+    min: 1,
+    max: 2048,
+    alignment: 1,
+});
+let activation_shape = Shape(vec![Dim::Static(4096), seq_len]);
+let activation = graph.new_tensor(
+    activation_shape,
+    DType::F16,
+    StorageClass::Activation { buffer: None },
+);
+
+// Add operation
+let output = graph.new_tensor(
+    activation_shape.clone(),
+    DType::F16,
+    StorageClass::Activation { buffer: None },
+);
+graph.add_node(
+    Op::MatMul,
+    vec![activation, weight],
+    output,
+    HashMap::new(),
+);
+```
+
+## Op Enum
+
+All operation types supported by the compiler.
+
+### Matrix Operations
+
+<ResponseField name="MatMul" type="Op">
+  General matrix multiplication (GEMM). Maps to prefill/decode variants.
+</ResponseField>
+
+<ResponseField name="BatchMatMul { transpose_b: bool }" type="Op">
+  Batched matrix multiplication with optional transpose.
+</ResponseField>
+
+<ResponseField name="MatVec" type="Op">
+  Matrix-vector product (decode-only optimization).
+</ResponseField>
+
+<ResponseField name="QuantizedMatMul { weight_dtype: DType }" type="Op">
+  Quantized matrix multiplication (Q8_0, Q4_0, Q4_MLX).
+</ResponseField>
+
+### Normalization
+
+<ResponseField name="RMSNorm { eps: f32 }" type="Op">
+  Root Mean Square normalization. Used in LLaMA, Mistral, Qwen.
+</ResponseField>
+
+<ResponseField name="LayerNorm { eps: f32 }" type="Op">
+  Standard layer normalization. Used in GPTNeoX.
+</ResponseField>
+
+<ResponseField name="QKNorm { eps: f32, num_heads: usize, head_dim: usize }" type="Op">
+  Per-head RMSNorm for Q/K projections (Qwen3-style).
+</ResponseField>
+
+### Positional Encoding
+
+<ResponseField name="RoPE { base: f64, interleaved: bool }" type="Op">
+  Rotary Position Embedding. `base` is typically 10000.0 or 500000.0.
+</ResponseField>
+
+### Activations
+
+<ResponseField name="SiLU" type="Op">
+  Sigmoid Linear Unit. Used in SwiGLU.
+</ResponseField>
+
+<ResponseField name="GELU" type="Op">
+  Gaussian Error Linear Unit. Used in GeGLU and standard FFN.
+</ResponseField>
+
+<ResponseField name="ReLU" type="Op">
+  Rectified Linear Unit.
+</ResponseField>
+
+### Elementwise Operations
+
+<ResponseField name="Mul" type="Op">
+  Element-wise multiplication.
+</ResponseField>
+
+<ResponseField name="Add" type="Op">
+  Element-wise addition (residual connections).
+</ResponseField>
+
+<ResponseField name="Scale { factor: f32 }" type="Op">
+  Multiply by constant scalar.
+</ResponseField>
+
+### Attention
+
+<ResponseField name="ScaledDotProductAttention" type="Op">
+  Fused attention operation with causal masking support.
+  
+  Fields:
+  - `causal: bool` - Apply causal mask
+  - `gqa_factor: usize` - Grouped Query Attention repeat factor
+  - `head_dim: usize` - Dimension per head
+  - `scale: f32` - Attention scale (typically 1/√head_dim)
+  - `has_mask: bool` - Use attention mask input
+  - `has_sinks: bool` - Streaming LLM sink tokens
+</ResponseField>
+
+### Memory Operations
+
+<ResponseField name="Gather { axis: usize }" type="Op">
+  Embedding lookup. Index tensor gathers from weight table along axis.
+</ResponseField>
+
+<ResponseField name="Reshape { target_shape: Vec<i64> }" type="Op">
+  Zero-compute shape reinterpretation.
+</ResponseField>
+
+<ResponseField name="Transpose { perm: Vec<usize> }" type="Op">
+  Permute dimensions.
+</ResponseField>
+
+### KV Cache
+
+<ResponseField name="KVCacheAppend { layer: usize, role: KVRole }" type="Op">
+  Appends new key/value vectors to the cache for the given layer.
+  
+  - `layer: usize` - Transformer layer index
+  - `role: KVRole` - `KVRole::Key` or `KVRole::Value`
+</ResponseField>
+
+### Output
+
+<ResponseField name="LogitProjection" type="Op">
+  Final LM head projection (activations → vocab logits).
+</ResponseField>
+
+### Fused Operations
+
+<ResponseField name="Fused(FusionPattern)" type="Op">
+  Fused multi-op kernel. Created by optimization passes.
+  
+  Patterns:
+  - `RMSNormLinear` - Fused norm + matmul
+  - `SwiGLU` - Fused SiLU + multiply
+  - `QKVProjection` - Fused Q/K/V linear layers
+  - `LinearActivation` - Fused linear + activation
+</ResponseField>
+
+### Op Classification
+
+```rust
+impl Op {
+    pub fn is_compute_bound(&self) -> bool { /* MatMul, Attention, Fused */ }
+    pub fn is_memory_bound(&self) -> bool { /* RMSNorm, Elementwise */ }
+    pub fn is_zero_compute(&self) -> bool { /* Reshape, Transpose */ }
+}
+```
+
+## Type System
+
+### Shape
+
+Tensor shapes with static and runtime-parameterized dimensions.
+
+```rust
+pub struct Shape(pub Vec<Dim>);
+
+pub enum Dim {
+    Static(usize),           // Known at compile time
+    Param(ParamDim),         // Known at runtime (bounded)
+}
+
+pub struct ParamDim {
+    pub name: ParamName,     // SeqLen, TotalSeqLen, BatchSize
+    pub min: usize,
+    pub max: usize,
+    pub alignment: usize,
+}
+```
+
+**Example shapes:**
+- Embedding table: `[vocab_size, hidden_size]` → `[Static(128256), Static(4096)]`
+- Activation: `[hidden_size, seq_len]` → `[Static(4096), Param(SeqLen{1..8192})]`
+- KV cache: `[num_kv_heads, total_seq, head_dim]` → `[Static(8), Param(TotalSeqLen), Static(128)]`
+
+### DType
+
+Data types for tensors.
+
+```rust
+pub enum DType {
+    F32,     // 32-bit float
+    F16,     // 16-bit float (IEEE 754)
+    BF16,    // 16-bit BFloat16
+    U32,     // 32-bit unsigned integer (token IDs)
+    Q8_0,    // 8-bit quantized (32-element blocks)
+    Q4_0,    // 4-bit quantized (32-element blocks)
+    Q4_MLX,  // MLX-style 4-bit (128-element blocks)
+}
+```
+
+### StorageClass
+
+Where a tensor lives in memory.
+
+```rust
+pub enum StorageClass {
+    Weight(WeightBinding),
+    Activation { buffer: Option<BufferId> },
+    KVCache { layer: usize, head_group: usize, role: KVRole },
+}
+
+pub struct WeightBinding {
+    pub name: String,
+    pub byte_offset: usize,
+    pub byte_size: usize,
+    pub file_shape: Vec<usize>,
+    pub file_dtype: DType,
+}
+```
+
+## Printer Utilities
+
+<ParamField path="dump_graph(graph)" type="String">
+  Generates a human-readable IR dump for debugging.
+  
+  **Parameters:**
+  - `graph: &CompGraph` - The computation graph
+  
+  **Returns:** String representation of all nodes and tensors
+</ParamField>
+
+### Example Output
+
+```
+// CompGraph: meta-llama/Llama-3.2-1B (156 nodes, 312 tensors)
+// Architecture: LLaMA, 16 layers
+
+%0 = Gather(axis=0)(weight=model.embed_tokens.weight, %input) : [4096, seq] F16
+%1 = RMSNorm(eps=1e-5)(%0, weight=model.layers.0.input_layernorm.weight) : [4096, seq] F16
+%2 = MatMul(%1, weight=model.layers.0.self_attn.q_proj.weight) : [4096, seq] F16
+  [kernel: KernelId(42), path: Dual]
+...
+```
+
+### Usage
+
+```rust
+use unc::ir::printer::dump_graph;
+
+let ir = dump_graph(&graph);
+println!("{}", ir);
+
+// Or save to file
+std::fs::write("model.ir", ir)?;
+```
+
+## Related
+
+- [Frontend Module](/api/frontend) - Building graphs from models
+- [Compiler Module](/api/compiler) - Optimizing graphs
+- [Kernel Module](/api/kernel) - Kernel matching

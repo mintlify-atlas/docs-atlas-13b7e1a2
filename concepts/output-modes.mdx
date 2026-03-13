@@ -1,0 +1,589 @@
+---
+title: 'Output Modes'
+description: 'JIT vs AOT compilation: understanding UNC output formats'
+---
+
+## Overview
+
+UNC supports two compilation modes with different tradeoffs:
+
+1. **JIT Mode** (default): Just-in-time compilation via clang, cached for fast reuse
+2. **AOT Mode** (`--binary`): Ahead-of-time compiled standalone binaries with zero dependencies
+
+## JIT Mode (Default)
+
+### Output Format
+
+**Command**:
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 -o ./tinyllama
+```
+
+**Output**: `.unc` bundle directory
+```
+tinyllama.unc/
+  ├── graph.bin              # Serialized CompGraph (MessagePack)
+  ├── memory_plan.bin        # MemoryPlan (buffer allocations)
+  ├── metadata.json          # Model metadata (human-readable)
+  ├── unc_forward.m          # Generated Objective-C orchestrator
+  └── unc_kernels.metallib   # Compiled Metal shader library
+```
+
+### File Contents
+
+#### `graph.bin`
+- Serialized `CompGraph` using MessagePack format
+- Contains all IR nodes with kernel assignments
+- Includes tensor metadata (shapes, dtypes, storage)
+- Size: ~500 KB for 1B parameter model
+
+#### `memory_plan.bin`
+- Serialized `MemoryPlan`
+- Activation buffer allocations with aliasing
+- KV cache layout (per-layer offsets)
+- Decode region splits for concurrent dispatch
+- Size: ~10 KB
+
+#### `unc_forward.m`
+- Auto-generated Objective-C/C source code
+- Entry points: `unc_init()`, `unc_forward()`
+- Metal kernel dispatch logic with buffer bindings
+- Runtime branching for prefill vs decode
+- Size: ~100-300 KB (depends on model size)
+
+**Example excerpt**:
+```objc
+void unc_forward(
+    const uint32_t* token_ids,
+    uint32_t        seq_len,
+    uint32_t        total_seq_len,
+    float*          out_logits
+) {
+    UNCState* s = unc_state;
+    id<MTLCommandBuffer> cmd = [s->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    // Node 0: Gather (embedding lookup)
+    [enc setComputePipelineState:pso_gather_u32];
+    [enc setBuffer:s->weight_buf offset:0 atIndex:0];  // embed_table
+    [enc setBuffer:s->act_buf offset:8192 atIndex:1];  // token_ids
+    [enc setBuffer:s->act_buf offset:16384 atIndex:2]; // output
+    [enc dispatchThreadgroups:MTLSizeMake((seq_len + 255) / 256, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    // Node 1: RMSNorm
+    [enc setComputePipelineState:pso_rms_norm_f16];
+    // ... buffer bindings ...
+
+    // Node 2-4: Fused QKV GEMV (decode path)
+    if (seq_len == 1) {
+        [enc setComputePipelineState:pso_fused_qkv_qmv_fast_q4_0];
+        // ... buffer bindings ...
+    } else {
+        // Separate GEMM dispatches for prefill
+        // ...
+    }
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+}
+```
+
+#### `unc_kernels.metallib`
+- Compiled Metal shader binary
+- Contains all GPU kernels (GEMM, GEMV, RMSNorm, SDPA, etc.)
+- Copied from build-time compilation: `cargo build --release`
+- Size: ~500 KB
+
+### Runtime Workflow
+
+**First Run** (JIT compilation):
+```mermaid
+graph LR
+    A[Load .unc bundle] --> B[Deserialize graph]
+    B --> C[Compile orchestrator<br/>clang -O2]
+    C --> D[Cache compiled .dylib]
+    D --> E[Load Metal library]
+    E --> F[mmap weights]
+    F --> G[Execute forward pass]
+```
+
+**Subsequent Runs** (cached):
+```mermaid
+graph LR
+    A[Load .unc bundle] --> B[Check cache]
+    B --> C[Load compiled .dylib]
+    C --> D[Load Metal library]
+    D --> E[mmap weights]
+    E --> F[Execute forward pass]
+```
+
+**Implementation**: `src/runtime/`
+
+```rust
+// Pseudo-code
+let bundle = UNCBundle::load("tinyllama.unc")?;
+let graph = deserialize(bundle.graph_bin)?;
+let memory_plan = deserialize(bundle.memory_plan_bin)?;
+
+// Check cache
+let cache_path = format!("~/.cache/unc/{}_orchestrator.dylib", bundle_hash);
+let dylib = if cache_path.exists() {
+    load_dylib(cache_path)
+} else {
+    // JIT compile
+    let obj = compile_c_source(bundle.orchestrator_source, "-O2 -fobjc-arc")?;
+    let dylib = link_dylib(obj, "-framework Metal -framework Foundation")?;
+    save_to_cache(dylib, cache_path)?;
+    load_dylib(cache_path)
+};
+
+// Load symbols
+let unc_init = dylib.get_symbol::<fn(*const c_char, *mut c_void, usize, u8)>("unc_init")?;
+let unc_forward = dylib.get_symbol::<fn(*const u32, u32, u32, *mut f32)>("unc_forward")?;
+
+// Initialize
+let weight_data = mmap_safetensors(&bundle.weight_files)?;
+unc_init(
+    bundle.metallib_path.as_ptr(),
+    weight_data.as_ptr(),
+    weight_data.len(),
+    0, // weights_already_converted = false
+);
+
+// Run inference
+let token_ids = tokenize(prompt);
+let logits = vec![0.0f32; vocab_size];
+unc_forward(
+    token_ids.as_ptr(),
+    token_ids.len() as u32,
+    token_ids.len() as u32,
+    logits.as_mut_ptr(),
+);
+```
+
+### Compilation Details
+
+**Clang Command**:
+```bash
+clang -O2 -fobjc-arc -Wno-format \
+  unc_forward.m \
+  -framework Metal \
+  -framework Foundation \
+  -shared -o unc_orchestrator.dylib
+```
+
+**Optimization Flags**:
+- `-O2`: Optimize for speed
+- `-fobjc-arc`: Enable automatic reference counting
+- `-Wno-format`: Suppress printf format warnings (Metal uses NS types)
+
+**Compilation Time**:
+- Cold (first run): ~3-5 seconds
+- Cached: ~0.5 seconds (load dylib)
+
+### Cache Location
+
+**Default**: `~/.cache/unc/`
+
+**Cache Key**: SHA256 hash of:
+- Graph serialization
+- Memory plan
+- Orchestrator source
+- Compiler version
+
+**Example**:
+```
+~/.cache/unc/
+  ├── a3f8b2e1...c4d9_orchestrator.dylib
+  ├── f6d2c1a7...e3b5_orchestrator.dylib
+  └── ...
+```
+
+**Cache Invalidation**: Automatic when any input changes
+
+### Use Cases
+
+**Best for**:
+- ✅ **Development**: Fast iteration, easy debugging
+- ✅ **Experimentation**: Quick model swapping
+- ✅ **Testing**: Verify compilation correctness
+- ✅ **Local inference**: Personal use, no distribution
+
+**Limitations**:
+- ❌ Requires clang at runtime (Xcode Command Line Tools)
+- ❌ Separate weight files (not self-contained)
+- ❌ First-run JIT overhead (3-5s)
+
+## AOT Mode (Standalone Binary)
+
+### Output Format
+
+**Command**:
+```bash
+unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4-0 --binary -o ./tinyllama
+```
+
+**Output**: Single Mach-O executable
+```
+tinyllama          # 602 MB standalone binary (TinyLlama 1.1B Q4_0)
+```
+
+**No additional files required** — fully self-contained.
+
+### Binary Layout
+
+```
+┌─────────────────────────────────────┐  Offset 0
+│  Mach-O Executable                  │  
+│  - Embedded metallib (500 KB)      │  Embedded as C array
+│  - Embedded tokenizer (2 MB)       │  Vocab + BPE merges
+│  - Orchestrator code (1 MB)        │  unc_init / unc_forward
+│  - CLI main() (50 KB)              │  Argument parsing, sampling
+├─────────────────────────────────────┤  Padded to 16 KB boundary
+│  Padding (align to page boundary)  │  
+├─────────────────────────────────────┤  Offset: weight_offset
+│  Model Weights (safetensors)       │  
+│  - BF16 format (converted to F16)  │  600 MB (Q4_0 post-quant)
+│  - Quantized on GPU at init        │  
+├─────────────────────────────────────┤  Offset: weight_offset + weight_size
+│  8 bytes: weight_offset (u64 LE)   │  
+├─────────────────────────────────────┤  
+│  8 bytes: weight_size (u64 LE)     │  
+├─────────────────────────────────────┤  
+│  8 bytes: magic "UNCW8TSX"         │  Trailer magic
+└─────────────────────────────────────┘  EOF
+```
+
+**Trailer Format**:
+```c
+struct UNCTrailer {
+    uint64_t weight_offset;  // Byte offset from start of file
+    uint64_t weight_size;    // Size of weight data in bytes
+    uint8_t  magic[8];       // "UNCW8TSX" (UNC Weight 8-byte Trailer with Safetensors/X-format)
+};
+```
+
+**Page Alignment**:
+- Apple Silicon uses 16 KB pages
+- Weights must be page-aligned for `mmap()`
+- Padding inserted after Mach-O code section
+
+### Embedded Components
+
+#### 1. Metallib
+
+**Embedded as C array**:
+```c
+static const unsigned char unc_metallib_data[] = {
+    0x4d, 0x54, 0x4c, 0x42, 0x01, 0x00, 0x02, 0x00,  // MTL magic
+    0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // ... 500 KB of compiled Metal shaders ...
+};
+static const unsigned int unc_metallib_size = 524288;
+```
+
+**Runtime**:
+```c
+// Write to temp file (required by Metal API)
+char tmp_path[] = "/tmp/unc_metallib_XXXXXX.metallib";
+int fd = mkstemps(tmp_path, 9);
+write(fd, unc_metallib_data, unc_metallib_size);
+close(fd);
+
+// Load library
+NSURL* url = [NSURL fileURLWithPath:@(tmp_path)];
+id<MTLLibrary> lib = [device newLibraryWithURL:url error:&err];
+unlink(tmp_path);  // Clean up
+```
+
+#### 2. Tokenizer
+
+**Embedded as C arrays**:
+```c
+#define UNC_TOK_VOCAB_SIZE 32000
+#define UNC_TOK_N_MERGES 60000
+
+static const char* unc_vocab[] = {
+    "<unk>",
+    "<s>",
+    "</s>",
+    "▁",
+    "▁the",
+    "▁a",
+    // ... 32000 tokens ...
+};
+
+static const char* unc_merges[][2] = {
+    {"▁", "t"},
+    {"▁", "a"},
+    {"h", "e"},
+    // ... 60000 merge rules ...
+};
+
+// Sorted vocab for binary search
+static const struct { const char* tok; uint32_t id; } unc_vocab_sorted[] = {
+    {"!", 29871},
+    {"!!", 1273},
+    // ... sorted by token string ...
+};
+```
+
+**BPE Encode Implementation** (simplified):
+```c
+int unc_tok_encode(const char* text, uint32_t* out_ids, int max_ids) {
+    // 1. Preprocess: "Hello world" → "▁Hello▁world"
+    char* preprocessed = prepend_and_replace_spaces(text);
+    
+    // 2. Split into UTF-8 characters
+    BPEPiece* pieces = split_utf8_chars(preprocessed);
+    int n_pieces = count_pieces;
+    
+    // 3. Apply merges in priority order
+    for (int mi = 0; mi < UNC_TOK_N_MERGES && n_pieces > 1; mi++) {
+        const char* a = unc_merges[mi][0];
+        const char* b = unc_merges[mi][1];
+        
+        // Find and merge consecutive pieces
+        for (int i = 0; i < n_pieces - 1; i++) {
+            if (match(pieces[i], a) && match(pieces[i+1], b)) {
+                pieces[i] = concat(a, b);
+                shift_left(pieces, i+1, n_pieces);
+                n_pieces--;
+            }
+        }
+    }
+    
+    // 4. Convert pieces to token IDs
+    int n_ids = 0;
+    for (int i = 0; i < n_pieces; i++) {
+        int id = vocab_lookup(pieces[i].str, pieces[i].len);
+        if (id >= 0) out_ids[n_ids++] = id;
+    }
+    return n_ids;
+}
+```
+
+**BPE Decode**:
+```c
+void unc_tok_print(uint32_t id) {
+    const char* tok = unc_vocab[id];
+    // Replace ▁ (U+2581) with space
+    while (*tok) {
+        if (is_sentencepiece_space(tok)) {
+            putchar(' ');
+            tok += 3;  // UTF-8 sequence length
+        } else {
+            putchar(*tok++);
+        }
+    }
+}
+```
+
+#### 3. Self-mmap for Weights
+
+**Implementation**:
+```c
+void* load_appended_weights(size_t* out_size) {
+    // 1. Get path to self
+    char self_path[4096];
+    uint32_t path_len = sizeof(self_path);
+    _NSGetExecutablePath(self_path, &path_len);
+    
+    char* real_path = realpath(self_path, NULL);
+    int fd = open(real_path, O_RDONLY);
+    
+    // 2. Read trailer (last 24 bytes)
+    struct stat st;
+    fstat(fd, &st);
+    off_t file_size = st.st_size;
+    
+    uint8_t trailer[24];
+    pread(fd, trailer, 24, file_size - 24);
+    
+    // 3. Verify magic
+    if (memcmp(trailer + 16, "UNCW8TSX", 8) != 0) {
+        fprintf(stderr, "Error: no UNC weight trailer\n");
+        return NULL;
+    }
+    
+    // 4. Extract offsets
+    uint64_t weight_offset, weight_size;
+    memcpy(&weight_offset, trailer, 8);
+    memcpy(&weight_size, trailer + 8, 8);
+    
+    // 5. mmap weight region
+    void* mapped = mmap(
+        NULL,
+        (size_t)weight_size,
+        PROT_READ,
+        MAP_PRIVATE,
+        fd,
+        (off_t)weight_offset
+    );
+    close(fd);
+    
+    *out_size = (size_t)weight_size;
+    return mapped;
+}
+```
+
+### Runtime Workflow
+
+```mermaid
+graph LR
+    A[Execute binary] --> B[Write metallib to /tmp]
+    B --> C[mmap weights from self]
+    C --> D[unc_init]
+    D --> E[Convert BF16 → F16]
+    E --> F[Quantize to Q4_0]
+    F --> G[Tokenize prompt]
+    G --> H[Prefill forward pass]
+    H --> I[Decode loop]
+    I --> J[Print tokens]
+```
+
+**Startup Time**:
+- Extract metallib: ~10 ms
+- mmap weights: ~50 ms (zero-copy)
+- BF16 → F16 conversion: ~200 ms (GPU)
+- Quantization (Q4_0): ~300 ms (GPU)
+- **Total cold start: ~560 ms**
+
+**No JIT compilation** — instant execution after init.
+
+### CLI Interface
+
+**Built-in**:
+```bash
+./tinyllama --prompt "The history of" --max-tokens 200
+```
+
+**Help**:
+```bash
+./tinyllama --help
+Usage: ./tinyllama [--prompt TEXT] [--max-tokens N]
+```
+
+**Example**:
+```bash
+$ ./tinyllama --prompt "Once upon a time" --max-tokens 50
+Once upon a time, there was a young girl named Lily who lived in a small village.
+She loved to play outside and explore the world around her. One day, while she
+was playing in the forest, she stumbled upon a magical tree. The tree was tall
+and had shiny leaves that sparkled in the sunlight.
+
+--- 50 tokens in 0.33s = 152.3 tok/s ---
+```
+
+### Size Comparison
+
+**TinyLlama 1.1B**:
+
+| Format | Code | Weights | Total |
+|--------|------|---------|-------|
+| **F16** | 2 MB | 2.2 GB | 2.2 GB |
+| **Q8_0** | 2 MB | 1.1 GB | 1.1 GB |
+| **Q4_0** | 2 MB | 600 MB | 602 MB |
+
+**Qwen3-4B Q4_0**: 2.1 GB binary
+
+**Code Size Breakdown**:
+- Metallib: 500 KB
+- Tokenizer: 1.5 MB (vocab + merges)
+- Orchestrator: 500 KB
+- Main + CLI: 50 KB
+
+### Use Cases
+
+**Best for**:
+- ✅ **Deployment**: Distribute single file
+- ✅ **Production**: No runtime dependencies
+- ✅ **Embedding**: Include in app bundle
+- ✅ **Performance**: Zero JIT overhead, instant startup
+- ✅ **Offline inference**: No filesystem dependencies
+
+**Limitations**:
+- ❌ Larger file size (embedded weights)
+- ❌ Single-shard models only (multi-shard support planned)
+- ❌ No dynamic model swapping
+- ❌ Recompile required for any changes
+
+## Comparison Table
+
+| Feature | JIT Mode | AOT Mode |
+|---------|----------|----------|
+| **Output** | `.unc` directory | Single binary |
+| **Size** | ~1 MB (no weights) | 600 MB - 10 GB |
+| **Dependencies** | clang, safetensors files | None |
+| **First Run** | 3-5s (JIT compile) | 560ms (GPU init) |
+| **Cached Run** | 0.5s (load dylib) | 560ms (GPU init) |
+| **Weight Storage** | External (mmap safetensors) | Embedded (self-mmap) |
+| **Tokenizer** | External JSON | Embedded BPE |
+| **Distribution** | Multi-file | Single file |
+| **Iteration** | Fast (no recompile) | Slow (full recompile) |
+| **Use Case** | Development, local use | Deployment, production |
+
+## Advanced: Hybrid Mode
+
+Combine JIT flexibility with AOT performance:
+
+**Approach**:
+1. Pre-compile orchestrator to `.dylib` (AOT)
+2. Store `.dylib` in `.unc` bundle
+3. Skip JIT compilation, load pre-compiled binary directly
+
+**Benefits**:
+- Instant startup (no JIT)
+- External weight files (smaller distribution)
+- Model swapping without recompilation
+
+**Implementation**: Experimental, not yet in release
+
+## Choosing the Right Mode
+
+### Use JIT if:
+- You're iterating on models or compilation settings
+- You want to test multiple models quickly
+- You have access to clang at runtime
+- You don't mind a 3-5s first-run overhead
+- You prefer smaller bundle sizes
+
+### Use AOT if:
+- You're deploying to production
+- You want a single distributable file
+- You need instant startup (no JIT overhead)
+- You can't rely on external dependencies
+- You're embedding in an app bundle
+- File size is not a concern (e.g., 2 GB is acceptable)
+
+### Performance Notes
+
+**Throughput** (tokens/second):
+- JIT and AOT have **identical runtime performance**
+- Both use the same compiled Metal kernels
+- Both use the same orchestrator code
+- Only difference is startup time
+
+**Startup Breakdown** (TinyLlama Q4_0):
+
+| Stage | JIT (first) | JIT (cached) | AOT |
+|-------|-------------|--------------|-----|
+| Load bundle | 50 ms | 50 ms | - |
+| JIT compile | 3000 ms | - | - |
+| Load dylib | 100 ms | 100 ms | - |
+| Extract metallib | - | - | 10 ms |
+| Load Metal library | 200 ms | 200 ms | 200 ms |
+| mmap weights | 50 ms | 50 ms | 50 ms |
+| BF16 → F16 | 200 ms | 200 ms | 200 ms |
+| Quantize F16 → Q4_0 | 300 ms | 300 ms | 300 ms |
+| **Total** | **3900 ms** | **900 ms** | **760 ms** |
+
+**Winner**: AOT for cold start, JIT (cached) for warm start with external weights
+
+## Related Documentation
+
+- [Architecture Overview](/concepts/architecture) - System design
+- [Compiler Pipeline](/concepts/compiler-pipeline) - Code generation process
+- [IR Graph](/concepts/ir-graph) - Intermediate representation

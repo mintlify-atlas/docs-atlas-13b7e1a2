@@ -1,0 +1,484 @@
+---
+title: 'Kernel Module'
+description: 'Kernel registry, matching, and Metal MLX kernels'
+---
+
+The kernel module manages the bridge between IR operations and executable GPU code through a kernel registry.
+
+## Overview
+
+The kernel module provides:
+- `KernelRegistry` - Database of available kernels
+- Kernel matching with constraint checking
+- Performance modeling for kernel selection
+- Metal MLX kernel library registration
+
+## KernelRegistry
+
+Central registry of all available kernels for all targets.
+
+```rust
+pub struct KernelRegistry {
+    entries: HashMap<KernelId, KernelEntry>,
+    index: HashMap<String, HashMap<OpClass, Vec<KernelId>>>,
+}
+```
+
+### Constructor
+
+<ParamField path="KernelRegistry::new()" type="Self">
+  Creates an empty kernel registry.
+</ParamField>
+
+### Methods
+
+<ParamField path="register(entry)" type="KernelId">
+  Registers a kernel and returns its assigned ID.
+  
+  **Parameters:**
+  - `entry: KernelEntry` - Kernel descriptor with pattern, constraints, and dispatch template
+  
+  **Returns:** Unique kernel identifier
+</ParamField>
+
+<ParamField path="find_best(op, input_tensors, output_shape, target, model_params)" type="Option<KernelMatch>">
+  Finds the best matching kernel for an operation.
+  
+  **Parameters:**
+  - `op: &Op` - Operation to match
+  - `input_tensors: &[&TensorRef]` - Input tensor shapes and types
+  - `output_shape: &Shape` - Expected output shape
+  - `target: &Target` - Target platform
+  - `model_params: Option<&ModelParams>` - Model parameters for dispatch sizing
+  
+  **Returns:** `KernelMatch` with kernel, dispatch config, and cost estimate, or `None` if no match
+</ParamField>
+
+<ParamField path="get(id)" type="Option<&KernelEntry>">
+  Retrieves a kernel entry by ID.
+</ParamField>
+
+<ParamField path="len()" type="usize">
+  Returns the number of registered kernels.
+</ParamField>
+
+### Usage Example
+
+```rust
+use unc::kernel::registry::KernelRegistry;
+use unc::kernel::metal_mlx::register_metal_mlx_kernels;
+use unc::target::MetalTarget;
+
+// Create registry
+let mut registry = KernelRegistry::new();
+
+// Register Metal MLX kernels
+let metal_target = MetalTarget { /* ... */ };
+register_metal_mlx_kernels(&mut registry, &metal_target);
+
+println!("Registered {} kernels", registry.len());
+
+// Match a kernel
+let kernel_match = registry.find_best(
+    &Op::MatMul,
+    &[&input_tensor, &weight_tensor],
+    &output_shape,
+    &Target::Metal(metal_target),
+    Some(&model_params),
+)?;
+
+println!("Matched kernel: {}", kernel_match.kernel.name);
+println!("Dispatch: {:?}", kernel_match.dispatch);
+println!("Estimated cost: {:.2}", kernel_match.estimated_cost);
+```
+
+## KernelEntry
+
+Descriptor for a single kernel.
+
+```rust
+pub struct KernelEntry {
+    pub id: KernelId,
+    pub name: String,
+    pub op_pattern: OpPattern,
+    pub input_constraints: Vec<TensorConstraint>,
+    pub output_dtype: DType,
+    pub target: Target,
+    pub source: KernelSource,
+    pub dispatch_template: DispatchTemplate,
+    pub perf_model: PerfModel,
+}
+```
+
+### Fields
+
+<ResponseField name="id" type="KernelId">
+  Unique identifier assigned by registry.
+</ResponseField>
+
+<ResponseField name="name" type="String">
+  Kernel function name in the compiled library (e.g., `"gemm_f16_64x64"`).
+</ResponseField>
+
+<ResponseField name="op_pattern" type="OpPattern">
+  Operation pattern this kernel implements:
+  - `Single(Op)` - Single operation (e.g., RMSNorm)
+  - `Fused(FusionPattern)` - Fused multi-op pattern (e.g., SwiGLU)
+  - `FlashAttention` - Fused attention with head_dim support
+  - `GEMV` - Matrix-vector product (decode)
+  - `GEMM` - General matrix multiply (prefill)
+</ResponseField>
+
+<ResponseField name="input_constraints" type="Vec<TensorConstraint>">
+  Requirements for input tensors (dtype, shape ranges, layout, alignment).
+</ResponseField>
+
+<ResponseField name="output_dtype" type="DType">
+  Output data type.
+</ResponseField>
+
+<ResponseField name="target" type="Target">
+  Target platform (Metal, CUDA, etc.).
+</ResponseField>
+
+<ResponseField name="source" type="KernelSource">
+  Where the kernel comes from:
+  - `MLX { file, variant }` - From MLX library
+  - `Custom { file }` - Custom kernel
+</ResponseField>
+
+<ResponseField name="dispatch_template" type="DispatchTemplate">
+  GPU dispatch configuration template (grid, threadgroup sizes).
+</ResponseField>
+
+<ResponseField name="perf_model" type="PerfModel">
+  Performance model for kernel selection:
+  - `ComputeBound { utilization }` - FLOPs-limited
+  - `MemoryBound { utilization }` - Bandwidth-limited
+  - `Roofline` - Both compute and memory bounds
+  - `Fixed(cost)` - Constant cost estimate
+</ResponseField>
+
+## OpPattern
+
+Describes what operation pattern a kernel implements.
+
+```rust
+pub enum OpPattern {
+    Single(Op),
+    Fused(FusionPattern),
+    FlashAttention {
+        supported_head_dims: Vec<usize>,
+        causal: bool,
+        max_gqa_factor: usize,
+    },
+    GEMV {
+        quantized: bool,
+        weight_dtype: Option<DType>,
+    },
+    GEMM {
+        tile_m: u32,
+        tile_n: u32,
+        tile_k: u32,
+    },
+}
+```
+
+### Pattern Matching
+
+```rust
+impl OpPattern {
+    pub fn matches(&self, op: &Op) -> bool { /* ... */ }
+}
+```
+
+**Examples:**
+- `Single(Op::RMSNorm { eps: _ })` matches any `Op::RMSNorm`
+- `FlashAttention { supported_head_dims: vec![64, 128], causal: true, max_gqa_factor: 8 }` matches `ScaledDotProductAttention` with head_dim in {64, 128} and gqa_factor ≤ 8
+- `GEMM { tile_m: 64, tile_n: 64, tile_k: 16 }` matches `MatMul`, `BatchMatMul`, and `LogitProjection`
+
+## TensorConstraint
+
+Constraints on input tensors for kernel applicability.
+
+```rust
+pub struct TensorConstraint {
+    pub dtypes: Vec<DType>,
+    pub shape_ranges: Vec<Option<DimRange>>,
+    pub layout: LayoutRequirement,
+    pub alignment: usize,
+}
+
+pub struct DimRange {
+    pub min: usize,
+    pub max: usize,
+    pub divisible_by: Option<usize>,
+}
+
+pub enum LayoutRequirement {
+    Any,
+    RowMajor,
+    ColMajor,
+    Contiguous,
+}
+```
+
+### Example Constraints
+
+```rust
+// GEMM kernel: accepts F16 or F32, any shape
+TensorConstraint {
+    dtypes: vec![DType::F16, DType::F32],
+    shape_ranges: vec![],
+    layout: LayoutRequirement::Any,
+    alignment: 1,
+}
+
+// SIMD kernel: requires 16-byte alignment and head_dim divisible by 8
+TensorConstraint {
+    dtypes: vec![DType::F16],
+    shape_ranges: vec![
+        None,  // Any batch size
+        Some(DimRange { min: 64, max: 128, divisible_by: Some(8) }),
+    ],
+    layout: LayoutRequirement::Contiguous,
+    alignment: 16,
+}
+```
+
+## DispatchTemplate
+
+Template for GPU dispatch configuration.
+
+```rust
+pub struct DispatchTemplate {
+    pub threadgroup: [u32; 3],          // Threads per threadgroup
+    pub grid_rules: [GridRule; 3],      // How to compute grid size
+    pub shared_memory_bytes: u32,
+}
+
+pub enum GridRule {
+    Constant(u32),
+    CeilDivOutputDim { axis: usize, tile_size: u32 },
+    CeilDivInputDim { input_idx: usize, axis: usize, tile_size: u32 },
+    ModelParam(String),                  // e.g., "num_heads"
+    RuntimeParam(ParamName),             // e.g., SeqLen
+}
+```
+
+### Template Resolution
+
+```rust
+impl DispatchTemplate {
+    pub fn resolve(
+        &self,
+        inputs: &[&TensorRef],
+        output_shape: &Shape,
+        model_params: Option<&ModelParams>,
+    ) -> DispatchConfig { /* ... */ }
+}
+```
+
+**Example:** GEMM kernel with 64×64 tiles
+```rust
+DispatchTemplate {
+    threadgroup: [256, 1, 1],  // 256 threads
+    grid_rules: [
+        GridRule::CeilDivOutputDim { axis: 0, tile_size: 64 },  // M dimension
+        GridRule::CeilDivOutputDim { axis: 1, tile_size: 64 },  // N dimension
+        GridRule::Constant(1),
+    ],
+    shared_memory_bytes: 8192,
+}
+```
+
+For output shape `[4096, 128]`, resolves to:
+```rust
+DispatchConfig {
+    grid: [
+        DispatchDim::Static((4096 + 63) / 64),  // 64 threadgroups
+        DispatchDim::Static((128 + 63) / 64),   // 2 threadgroups
+        DispatchDim::Static(1),
+    ],
+    threadgroup: [256, 1, 1],
+    shared_memory_bytes: 8192,
+}
+```
+
+## KernelMatch
+
+Result of successful kernel matching.
+
+```rust
+pub struct KernelMatch {
+    pub kernel: KernelEntry,
+    pub estimated_cost: f64,
+    pub dispatch: DispatchConfig,
+}
+```
+
+<ResponseField name="kernel" type="KernelEntry">
+  The matched kernel descriptor.
+</ResponseField>
+
+<ResponseField name="estimated_cost" type="f64">
+  Performance cost estimate (lower is better). Used to select between multiple matching kernels.
+</ResponseField>
+
+<ResponseField name="dispatch" type="DispatchConfig">
+  Resolved dispatch configuration for this operation instance.
+</ResponseField>
+
+## Metal MLX Kernels
+
+UNC uses MLX's optimized Metal kernels for Apple Silicon.
+
+<ParamField path="register_metal_mlx_kernels(registry, target)" type="()">
+  Registers all Metal MLX kernels for the given target.
+  
+  **Parameters:**
+  - `registry: &mut KernelRegistry` - Registry to populate
+  - `target: &MetalTarget` - Metal target information
+</ParamField>
+
+### Registered Kernel Classes
+
+**Matrix Operations:**
+- GEMM (prefill): 64×64, 32×32 tiles for F16/F32
+- GEMV (decode): Optimized matrix-vector products
+- Quantized GEMV: Q8_0, Q4_0, Q4_MLX formats
+
+**Normalization:**
+- RMSNorm: Root mean square normalization
+- LayerNorm: Standard layer normalization
+- QKNorm: Per-head Q/K normalization (Qwen3)
+
+**Attention:**
+- FlashAttention: Fused scaled dot-product attention
+- Supports head_dim in {64, 96, 128}
+- GQA factors up to 8
+- Causal masking
+
+**Activations & Elementwise:**
+- SiLU, GELU, ReLU
+- Element-wise Add, Mul, Scale
+- Softmax
+
+**Positional:**
+- RoPE: Rotary position embeddings
+
+**Memory:**
+- Gather: Embedding lookup
+- KVCacheAppend: KV cache management
+
+**Fused Operations:**
+- RMSNormLinear: Fused norm + matmul
+- SwiGLU: Fused SiLU + multiply
+- QKVProjection: Fused Q/K/V linear
+- RoPE+KV+SDPA: Super-fused attention path
+
+### Usage Example
+
+```rust
+use unc::kernel::registry::KernelRegistry;
+use unc::kernel::metal_mlx::register_metal_mlx_kernels;
+use unc::target::MetalTarget;
+
+// Detect Metal target
+let metal_target = MetalTarget {
+    compute_units: 32,
+    max_buffer_size: 4 * 1024 * 1024 * 1024,  // 4 GB
+    supports_simd_shuffle: true,
+    max_threadgroup_memory: 32768,
+};
+
+// Register kernels
+let mut registry = KernelRegistry::new();
+register_metal_mlx_kernels(&mut registry, &metal_target);
+
+println!("Registered {} Metal kernels", registry.len());
+```
+
+## Performance Modeling
+
+```rust
+pub enum PerfModel {
+    ComputeBound { utilization: f32 },
+    MemoryBound { utilization: f32 },
+    Roofline { compute_utilization: f32, memory_utilization: f32 },
+    Fixed(f64),
+}
+```
+
+### Cost Estimation
+
+The registry estimates kernel cost for ranking:
+
+- **ComputeBound:** `cost = output_numel / utilization`
+- **MemoryBound:** `cost = total_input_bytes / utilization`
+- **Roofline:** `cost = max(compute_cost, memory_cost)`
+- **Fixed:** User-specified constant cost
+
+Higher utilization = lower cost = better kernel.
+
+### Example
+
+```rust
+use unc::kernel::registry::{PerfModel, KernelEntry};
+
+// GEMM kernel with 80% compute utilization
+let entry = KernelEntry {
+    perf_model: PerfModel::ComputeBound { utilization: 0.8 },
+    // ... other fields
+};
+
+// Estimate cost for 4096x4096 output
+// cost = 4096*4096 / 0.8 = 20,971,520
+```
+
+## Complete Example
+
+```rust
+use unc::kernel::registry::{KernelRegistry, KernelEntry, OpPattern, TensorConstraint, DispatchTemplate, GridRule, PerfModel, KernelSource};
+use unc::ir::ops::Op;
+use unc::ir::types::DType;
+use unc::target::Target;
+
+// Create registry
+let mut registry = KernelRegistry::new();
+
+// Register a custom RMSNorm kernel
+let entry = KernelEntry {
+    id: KernelId(0),  // Assigned by registry
+    name: "rms_norm_f16".to_string(),
+    op_pattern: OpPattern::Single(Op::RMSNorm { eps: 1e-5 }),
+    input_constraints: vec![
+        TensorConstraint::any(vec![DType::F16]),
+        TensorConstraint::any(vec![DType::F16]),
+    ],
+    output_dtype: DType::F16,
+    target: Target::Metal(metal_target),
+    source: KernelSource::Custom {
+        file: "kernels/norm.metal".to_string(),
+    },
+    dispatch_template: DispatchTemplate {
+        threadgroup: [256, 1, 1],
+        grid_rules: [
+            GridRule::CeilDivOutputDim { axis: 0, tile_size: 256 },
+            GridRule::Constant(1),
+            GridRule::Constant(1),
+        ],
+        shared_memory_bytes: 0,
+    },
+    perf_model: PerfModel::MemoryBound { utilization: 0.6 },
+};
+
+let kernel_id = registry.register(entry);
+println!("Registered kernel: {:?}", kernel_id);
+```
+
+## Related
+
+- [Compiler Module](/api/compiler) - Kernel matching pass
+- [IR Module](/api/ir) - Operation types
+- [Emit Module](/api/emit) - Code generation

@@ -1,0 +1,689 @@
+---
+title: 'Compiler Pipeline'
+description: 'Detailed walkthrough of UNC optimization passes and code generation'
+---
+
+## Overview
+
+The UNC compiler transforms a high-level IR graph from the frontend into an optimized, hardware-specific execution plan. The pipeline consists of multiple optimization passes followed by code generation and binary emission.
+
+## Compilation Stages
+
+```mermaid
+graph LR
+    A[Parse config.json] --> B[Load safetensors]
+    B --> C[Build IR from template]
+    C --> D[Optimization Passes]
+    D --> E[Kernel Matching]
+    E --> F[Memory Planning]
+    F --> G[Code Generation]
+    G --> H[Binary Emission]
+```
+
+## Stage 1: Frontend Processing
+
+### Parse Configuration
+
+**Input**: HuggingFace `config.json`
+
+**Process**:
+```rust
+// src/frontend/config.rs
+pub struct ModelParams {
+    pub hidden_size: usize,              // e.g., 4096
+    pub num_hidden_layers: usize,        // e.g., 32
+    pub num_attention_heads: usize,      // e.g., 32
+    pub num_kv_heads: usize,             // e.g., 8 (GQA)
+    pub head_dim: usize,                 // e.g., 128
+    pub intermediate_size: usize,        // e.g., 14336 (FFN)
+    pub vocab_size: usize,               // e.g., 32000
+    pub max_position_embeddings: usize,  // e.g., 8192
+    pub rms_norm_eps: f64,               // e.g., 1e-5
+    pub rope_theta: f64,                 // e.g., 10000.0
+    pub attention_type: AttentionType,   // MHA, GQA, or MQA
+    pub ffn_type: FFNType,               // Standard or SwiGLU
+}
+```
+
+**Output**: Parsed `ModelParams`
+
+### Load Weight Files
+
+**Input**: HuggingFace model ID (e.g., `"TinyLlama/TinyLlama-1.1B-Chat-v1.0"`)
+
+**Process**:
+1. Query HuggingFace Hub API
+2. Download `config.json`, `tokenizer.json`
+3. Download safetensors shards:
+   - Single-shard: `model.safetensors`
+   - Multi-shard: Parse `model.safetensors.index.json`, download all shards
+4. Cache locally (default: `~/.cache/huggingface/hub/`)
+
+**Implementation**: `src/frontend/huggingface.rs`
+
+```rust
+pub struct ModelFiles {
+    pub config_json: PathBuf,
+    pub tokenizer_json: Option<PathBuf>,
+    pub weight_files: Vec<WeightFile>,
+    pub model_id: String,
+}
+
+pub enum WeightFile {
+    Safetensors { path: PathBuf, shard_index: Option<usize> },
+    Gguf { path: PathBuf },
+}
+```
+
+## Stage 2: Build IR Graph
+
+### Model Templates
+
+**Input**: `ModelParams` + architecture family
+
+**Process**: Select template based on architecture:
+
+```rust
+// src/frontend/templates/
+match architecture {
+    ArchitectureFamily::LLaMA => lower_llama(params),
+    ArchitectureFamily::Mistral => lower_mistral(params),
+    ArchitectureFamily::Qwen => lower_qwen(params),
+    ArchitectureFamily::Phi => lower_phi(params),
+    ArchitectureFamily::Gemma => lower_gemma(params),
+}
+```
+
+Each template constructs the full computation graph:
+
+**Example: LLaMA Template** (`src/frontend/templates/llama.rs`)
+
+```rust
+// Input: token_ids [seq_len]
+let token_ids = graph.new_tensor(
+    Shape(vec![seq_dim]),
+    DType::U32,
+    StorageClass::Activation,
+);
+
+// Embedding lookup: [seq_len, hidden_size]
+let embed_table = weight("model.embed_tokens.weight", [vocab, hidden]);
+let x = graph.add_node(Op::Gather { axis: 0 }, vec![embed_table, token_ids], ...);
+
+// For each layer:
+for layer in 0..num_layers {
+    // Attention block
+    let norm_out = rms_norm(x);
+    let q = matmul(norm_out, q_weight);
+    let k = matmul(norm_out, k_weight);
+    let v = matmul(norm_out, v_weight);
+    let q_rope = rope(q);
+    let k_rope = rope(k);
+    let k_cache = kv_cache_append(k_rope, layer, Key);
+    let v_cache = kv_cache_append(v_rope, layer, Value);
+    let attn_out = scaled_dot_product_attention(q_rope, k_cache, v_cache);
+    let attn_proj = matmul(attn_out, o_weight);
+    x = add(x, attn_proj);  // Residual
+
+    // FFN block (SwiGLU)
+    let norm_out = rms_norm(x);
+    let gate = matmul(norm_out, gate_weight);
+    let up = matmul(norm_out, up_weight);
+    let gate_act = silu(gate);
+    let ffn_hidden = mul(gate_act, up);  // SwiGLU
+    let ffn_out = matmul(ffn_hidden, down_weight);
+    x = add(x, ffn_out);  // Residual
+}
+
+// Final norm + output projection
+let x = rms_norm(x);
+let logits = matmul(x, lm_head_weight);  // [seq_len, vocab_size]
+```
+
+**Output**: `CompGraph` with placeholder weight offsets
+
+**Graph Structure**:
+```rust
+pub struct CompGraph {
+    pub nodes: Vec<Node>,                  // Topologically sorted operations
+    pub tensors: HashMap<TensorId, TensorRef>,
+    pub inputs: Vec<TensorId>,             // Model inputs (token_ids)
+    pub outputs: Vec<TensorId>,            // Model outputs (logits)
+    pub metadata: GraphMetadata,
+}
+
+pub struct Node {
+    pub id: NodeId,
+    pub op: Op,                            // Operation type
+    pub inputs: Vec<TensorId>,
+    pub output: TensorId,
+    pub kernel: Option<KernelAssignment>,  // Filled by kernel_matching pass
+}
+```
+
+## Stage 3: Optimization Passes
+
+### Pass Pipeline
+
+**Implementation**: `src/compile/mod.rs`
+
+```rust
+pub struct PassPipeline {
+    pub passes: Vec<PassKind>,
+}
+
+impl Default for PassPipeline {
+    fn default() -> Self {
+        PassPipeline {
+            passes: vec![
+                PassKind::WeightBindingResolution,
+                PassKind::DeadCodeElimination,
+                PassKind::QKVFusion,
+                PassKind::ElementwiseFusion,
+                PassKind::AttentionFusion,
+                PassKind::DeadCodeElimination,
+                PassKind::DualPathInsertion,
+                PassKind::KernelMatching,
+                PassKind::LayoutOptimization,
+                PassKind::MemoryPlanning,
+                PassKind::Scheduling,
+            ],
+        }
+    }
+}
+```
+
+### 1. Weight Binding Resolution
+
+**Input**: Graph with placeholder weight offsets
+
+**Process**:
+1. Parse safetensors headers to extract tensor metadata
+2. For each weight tensor in graph:
+   - Look up tensor by name in safetensors
+   - Record byte offset and size
+   - Validate shape matches
+3. Update `WeightBinding` structs in graph
+
+**Implementation**: `src/compile/passes/weight_binding.rs`
+
+```rust
+pub fn resolve_weight_bindings(
+    graph: &mut CompGraph,
+    weight_files: &[WeightFile],
+) -> anyhow::Result<()> {
+    // Parse all safetensors headers
+    let mut tensor_map = HashMap::new();
+    for wf in weight_files {
+        let metadata = parse_safetensors_header(wf.path())?;
+        tensor_map.extend(metadata);
+    }
+
+    // Resolve each weight tensor
+    for tensor in graph.tensors.values_mut() {
+        if let StorageClass::Weight(ref mut binding) = tensor.storage {
+            let info = tensor_map.get(&binding.name)
+                .ok_or_else(|| anyhow!("weight not found: {}", binding.name))?;
+            binding.byte_offset = info.data_offset;
+            binding.byte_size = info.size_bytes;
+        }
+    }
+    Ok(())
+}
+```
+
+**Output**: Graph with resolved weight byte offsets
+
+### 2. Dead Code Elimination
+
+**Input**: Optimized graph
+
+**Process**:
+1. Mark all output tensors as live
+2. Recursively mark producer nodes and their inputs as live
+3. Remove unmarked nodes
+
+**Implementation**: `src/compile/passes/dce.rs`
+
+```rust
+pub fn eliminate_dead_code(graph: &mut CompGraph) {
+    let mut live_tensors = HashSet::new();
+    let mut live_nodes = HashSet::new();
+
+    // Start from outputs
+    let mut worklist: Vec<TensorId> = graph.outputs.clone();
+    while let Some(tid) = worklist.pop() {
+        if !live_tensors.insert(tid) { continue; }
+        // Find producer node
+        for node in &graph.nodes {
+            if node.output == tid {
+                live_nodes.insert(node.id);
+                worklist.extend(&node.inputs);
+            }
+        }
+    }
+
+    // Remove dead nodes
+    graph.nodes.retain(|n| live_nodes.contains(&n.id));
+}
+```
+
+### 3. QKV Fusion
+
+**Input**: Graph with separate Q, K, V matmuls
+
+**Process**:
+1. Detect pattern: 3 consecutive MatMul nodes with same input
+2. Verify output dimensions match (Q: [seq, num_heads*head_dim], K/V: [seq, num_kv_heads*head_dim])
+3. Replace with single `Fused(QKVProjection)` node
+4. Update output tensors to be slices of fused output
+
+**Implementation**: `src/compile/passes/qkv_fusion.rs`
+
+**Before**:
+```
+MatMul(x, Wq) → q [seq, h]
+MatMul(x, Wk) → k [seq, h_kv]
+MatMul(x, Wv) → v [seq, h_kv]
+```
+
+**After**:
+```
+Fused(QKVProjection { q_size, k_size, v_size })(x, Wqkv) → [q, k, v]
+```
+
+**Benefits**: Single kernel dispatch, better memory locality
+
+### 4. Elementwise Fusion
+
+**Patterns**:
+1. **Add + RMSNorm**: Residual add followed by normalization
+2. **SiLU + Mul**: SwiGLU activation (gate SiLU, then multiply with up)
+3. **Linear + Activation**: MatMul followed by SiLU/GELU/ReLU
+4. **Linear + Residual Add**: MatMul with residual connection
+
+**Implementation**: `src/compile/passes/elementwise_fusion.rs`
+
+**Example: Add + RMSNorm Fusion**
+
+**Before**:
+```
+Add(x, residual) → x'
+RMSNorm(x', weight) → normalized
+```
+
+**After**:
+```
+Fused(AddRMSNorm)(x, residual, weight) → normalized
+```
+
+**Metal Kernel**: `add_rms_norm_f16` - single-pass fused kernel
+
+### 5. Dual Path Insertion
+
+**Input**: Graph with generic MatMul nodes
+
+**Process**:
+1. Analyze each MatMul node:
+   - Prefill: `seq_len > 1` → Use GEMM (batch matrix multiply)
+   - Decode: `seq_len = 1` → Use GEMV (matrix-vector)
+2. Replace `MatMul` with dual-path node:
+   ```rust
+   ExecutionPath::Dual {
+       prefill_kernel: "gemm_f16",
+       decode_kernel: "gemv_f16" or "qmv_fast_q4_0",
+   }
+   ```
+3. Runtime branches based on `seq_len` parameter
+
+**Implementation**: `src/compile/passes/dual_path.rs`
+
+**Benefits**:
+- GEMM: Optimized for large batch (prefill), uses threadgroup memory
+- GEMV: Optimized for single vector (decode), memory-bandwidth bound
+
+### 6. Kernel Matching
+
+**Input**: Graph with ops, target hardware info
+
+**Process**:
+1. Query kernel registry for each op
+2. Match op signature (input/output shapes, dtypes) to available kernels
+3. Assign `KernelAssignment` to each node:
+   ```rust
+   pub struct KernelAssignment {
+       pub kernel_id: KernelId,
+       pub kernel_name: String,         // Metal function name
+       pub dispatch: DispatchConfig,    // Grid/threadgroup dims
+       pub path: ExecutionPath,         // Prefill/Decode/Unified/Dual
+   }
+   ```
+
+**Implementation**: `src/compile/passes/kernel_matching.rs`
+
+**Kernel Registry**: `src/kernel/registry.rs`
+
+**Example Assignments**:
+- `MatMul(f16, [4096, 4096])` → `gemm_f16` (prefill), `gemv_f16` (decode)
+- `QuantizedMatVec(q4_0)` → `qmv_fast_q4_0`
+- `RMSNorm(eps=1e-5)` → `rms_norm_f16`
+- `RoPE(base=10000)` → `rope_f16`
+- `ScaledDotProductAttention(causal=true)` → `sdpa_vector_float16_t_128_128`
+
+**Dispatch Configuration**:
+```rust
+pub struct DispatchConfig {
+    pub grid: [DispatchDim; 3],          // Threadgroups (X, Y, Z)
+    pub threadgroup: [u32; 3],           // Threads per group
+    pub shared_memory_bytes: u32,
+}
+
+pub enum DispatchDim {
+    Static(u32),                         // Fixed at compile time
+    CeilDiv { param: ParamName, divisor: u32 },  // Runtime: ⌈seq_len / 16⌉
+    Expr(ParamExpr),                     // Complex runtime expression
+}
+```
+
+## Stage 4: Memory Planning
+
+**Input**: Optimized graph with kernel assignments
+
+**Process**: `src/compile/memory.rs`
+
+### Activation Buffer Allocation
+
+**Algorithm**: Greedy interval-graph coloring with lifetime analysis
+
+1. **Compute Liveness**:
+   ```rust
+   struct BufferLifetime {
+       first_write: usize,  // Node index where tensor is produced
+       last_read: usize,    // Last node index where tensor is consumed
+   }
+   ```
+
+2. **Sort by Size**: Largest tensors first for better packing
+
+3. **Greedy Coloring**: Assign each tensor to first compatible buffer
+   - Compatible: Lifetimes don't overlap
+   - Reuse existing buffer if possible
+   - Otherwise allocate new buffer
+
+4. **Split Decode Regions**: Create separate buffers for decode-only tensors (enables concurrent dispatch)
+
+**Example**:
+```
+Tensor A: lifetime [0, 10], size 4MB  → Buffer 0
+Tensor B: lifetime [5, 15], size 2MB  → Buffer 1 (overlaps A)
+Tensor C: lifetime [12, 20], size 4MB → Buffer 0 (no overlap with A)
+```
+
+**Memory Plan Output**:
+```rust
+pub struct MemoryPlan {
+    pub activation_buffers: Vec<BufferAllocation>,
+    pub kv_cache: KVCacheLayout,
+    pub total_activation_bytes: usize,
+    pub total_kv_cache_bytes: usize,
+    pub decode_regions: Vec<DecodeRegion>,
+}
+```
+
+### KV Cache Layout
+
+Pre-allocated for `max_seq_len`, persistent across decode steps:
+
+```rust
+pub struct KVCacheLayout {
+    pub layers: Vec<KVCacheLayerLayout>,
+    pub total_bytes: usize,
+}
+
+pub struct KVCacheLayerLayout {
+    pub layer_idx: usize,
+    pub key_offset: usize,
+    pub key_size_bytes: usize,
+    pub value_offset: usize,
+    pub value_size_bytes: usize,
+}
+```
+
+**Size Calculation**:
+```
+per_layer_bytes = 2 * num_kv_heads * head_dim * max_seq_len * sizeof(f16)
+total_kv_bytes = num_layers * per_layer_bytes
+```
+
+Example: LLaMA-7B (32 layers, 32 KV heads, 128 head_dim, 8192 max_seq):
+```
+per_layer = 2 * 32 * 128 * 8192 * 2 = 128 MB
+total = 32 * 128 MB = 4 GB
+```
+
+## Stage 5: Code Generation
+
+**Input**: `CompilationResult` (optimized graph + memory plan + target)
+
+**Process**: Generate Metal orchestrator code
+
+### Orchestrator Generation
+
+**File**: `src/emit/metal.rs`
+
+**Output**: Objective-C source file with:
+
+1. **Model Constants**:
+   ```objc
+   #define UNC_NUM_LAYERS       32
+   #define UNC_HIDDEN_SIZE      4096
+   #define UNC_NUM_HEADS        32
+   #define UNC_VOCAB_SIZE       32000
+   #define UNC_MAX_SEQ_LEN      8192
+   #define UNC_ACTIVATION_BYTES 268435456  // 256 MB
+   #define UNC_KV_CACHE_BYTES   4294967296 // 4 GB
+   ```
+
+2. **Initialization Function** (`unc_init`):
+   - Load compiled `.metallib`
+   - Create Metal device, command queue, library
+   - Wrap weight data in MTLBuffer (no-copy mmap)
+   - Convert BF16 → F16 on GPU
+   - Quantize weights (F16 → Q4_0/Q8_0) if needed
+   - Allocate activation buffers (prefill + decode)
+   - Allocate KV cache
+   - Pre-warm pipeline states for all kernels
+   - Generate RoPE cos/sin table
+
+3. **Forward Pass Function** (`unc_forward`):
+   - Runtime parameters: `token_ids`, `seq_len`, `total_seq_len`
+   - Branch on `seq_len` for prefill vs decode
+   - For each node in graph:
+     - Resolve buffer bindings (weights, activations, KV cache)
+     - Set kernel arguments
+     - Dispatch compute command
+   - Commit command buffer, wait for completion
+   - Copy logits to output buffer
+
+**Example Dispatch** (simplified):
+```objc
+// Node: MatMul(x, W_q) → q
+id<MTLComputePipelineState> pso = (seq_len > 1) ? pso_gemm_f16 : pso_gemv_f16;
+id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+[enc setComputePipelineState:pso];
+[enc setBuffer:act_buf offset:x_offset atIndex:0];      // Input x
+[enc setBuffer:weight_buf offset:wq_offset atIndex:1];  // Weight W_q
+[enc setBuffer:act_buf offset:q_offset atIndex:2];      // Output q
+[enc setBytes:&seq_len length:4 atIndex:3];
+[enc setBytes:&hidden_size length:4 atIndex:4];
+[enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+[enc endEncoding];
+```
+
+### Fusion at Emission
+
+Additional fusions applied during code generation:
+
+1. **QKV GEMV Fusion**: 3 separate GEMVs → 1 dispatch (decode only)
+   ```objc
+   fused_qkv_gemv_f16(x, Wq, Wk, Wv, q_out, k_out, v_out)
+   ```
+
+2. **Gate+Up+SwiGLU Fusion**: gate GEMV + up GEMV + SiLU + Mul → 1 dispatch
+   ```objc
+   fused_gate_up_swiglu_qmv_fast_q4_0(x, W_gate, W_up, swiglu_out)
+   ```
+
+3. **RoPE + KV Append Fusion**: RoPE(q), RoPE(k), KVAppend(k), KVAppend(v) → 1 dispatch
+   ```objc
+   rope_qk_kv_append_f16(q, k, v, rope_table, kv_cache, layer, pos)
+   ```
+
+4. **Add + RMSNorm + QKV Fusion**: Residual + norm + 3 GEMVs → 1 dispatch (decode only)
+   ```objc
+   fused_add_rmsnorm_qkv_qmv_fast_q4_0(x, residual, norm_w, Wq, Wk, Wv, q, k, v)
+   ```
+
+5. **PSQ Pipeline**: Split RMSNorm across writer (GEMV) and reader (QKV/GateUp)
+   - Writer: GEMV + residual add + emit partial sum-of-squares
+   - Reader: Read partial sums → compute norm scale → normalize input on-the-fly
+   - **Eliminates**: Separate Add + RMSNorm dispatches (22 per forward pass)
+
+**Result**: 3-5x fewer kernel dispatches for decode path
+
+## Stage 6: Target-Specific Optimization
+
+**Target Detection**: `src/target/`
+
+```rust
+pub struct Target {
+    pub device_name: String,
+    pub family: AppleGPUFamily,  // M1, M2, M3
+    pub memory_bandwidth_gbps: f64,
+    pub max_threadgroup_memory: usize,
+    pub simd_width: usize,
+}
+```
+
+**Adaptations**:
+- M1: Optimize for 200 GB/s bandwidth
+- M2: Optimize for 400 GB/s
+- M3 Max: Optimize for 800 GB/s
+- Threadgroup size tuning (1024 on M1/M2, 2048 on M3)
+- SIMD shuffle patterns for RoPE (32-wide)
+
+## Stage 7: Binary Emission
+
+### JIT Mode (default)
+
+**Output**: `.unc` bundle directory
+
+**Contents**:
+```
+model.unc/
+  graph.bin          # Serialized CompGraph (MessagePack)
+  memory_plan.bin    # MemoryPlan
+  unc_forward.m      # Generated orchestrator source
+  unc_kernels.metallib  # Compiled Metal shaders
+```
+
+**Runtime**:
+1. Deserialize graph and memory plan
+2. JIT compile orchestrator: `clang -O2 -fobjc-arc unc_forward.m`
+3. Cache compiled binary: `~/.cache/unc/model_hash.dylib`
+4. Load and execute
+
+### AOT Mode (`--binary`)
+
+**Output**: Standalone Mach-O executable
+
+**Implementation**: `src/emit/aot.rs`
+
+**Process**:
+1. Embed metallib as C byte array
+2. Embed tokenizer (vocab + BPE merges) as C arrays
+3. Generate standalone `main.c` with:
+   - Embedded metallib
+   - Embedded tokenizer (BPE encoder/decoder)
+   - Orchestrator code
+   - CLI argument parsing
+   - Self-mmap for weights (read from appended binary section)
+4. Compile: `clang -O2 -framework Metal -framework Foundation main.c -o binary`
+5. Append weights: `[Mach-O][pad to 16KB][weights][trailer]`
+6. Trailer: `[8B offset][8B size][8B magic "UNCW8TSX"]`
+
+**Binary Layout**:
+```
+[Mach-O executable code]
+[Padding to 16KB page boundary]
+[Safetensors weight data]
+[8 bytes: weight offset (u64 LE)]
+[8 bytes: weight size (u64 LE)]
+[8 bytes: magic "UNCW8TSX"]
+```
+
+**Runtime**:
+```c
+// Read trailer from self
+open(argv[0]);
+pread(fd, trailer, 24, file_size - 24);
+mmap(NULL, weight_size, PROT_READ, MAP_PRIVATE, fd, weight_offset);
+unc_init(metallib_tmp, weight_ptr, weight_size, 0);
+```
+
+**Size Example** (TinyLlama 1.1B Q4_0):
+- Code: 2 MB (orchestrator + metallib + tokenizer)
+- Weights: 600 MB (quantized)
+- Total: 602 MB standalone binary
+
+## Compilation Statistics
+
+**Output**:
+```rust
+pub struct CompilationStats {
+    pub nodes_before: usize,           // Before optimization
+    pub nodes_after: usize,            // After optimization
+    pub unique_kernels: usize,         // Number of distinct Metal kernels
+    pub fusions_applied: usize,        // Fusion pass count
+    pub estimated_flops_per_token: f64,
+    pub peak_activation_bytes: usize,
+    pub kernel_launches_per_forward: usize,
+}
+```
+
+**Example** (TinyLlama 1.1B):
+```
+Nodes before: 1,243
+Nodes after: 412
+Fusions applied: 186
+Unique kernels: 43
+Peak activation: 256 MB
+Kernel launches (prefill): 412
+Kernel launches (decode): 187  (55% reduction via fusion)
+```
+
+## Performance Impact
+
+### Optimization Results
+
+| Optimization | Speedup | Notes |
+|--------------|---------|-------|
+| Dual-path GEMM/GEMV | 2.1x | Decode-optimized kernels |
+| QKV fusion | 1.15x | 3 dispatches → 1 |
+| Add+RMSNorm fusion | 1.08x | 44 dispatches → 22 |
+| RoPE+KV fusion | 1.12x | 44 dispatches → 22 |
+| PSQ pipeline | 1.06x | Eliminates 22 dispatch boundaries |
+| Q4_0 quantization | 2.0x | Memory bandwidth bound |
+| **Total** | **3.2x** | vs unoptimized F16 |
+
+### Compilation Time
+
+- **JIT (first run)**: 5-10 seconds (includes clang compilation)
+- **JIT (cached)**: 0.5 seconds (load precompiled binary)
+- **AOT**: 15-30 seconds (full ahead-of-time compilation)
+
+## Related Documentation
+
+- [Architecture Overview](/concepts/architecture) - High-level system design
+- [IR Graph](/concepts/ir-graph) - Intermediate representation details
+- [Output Modes](/concepts/output-modes) - JIT vs AOT comparison

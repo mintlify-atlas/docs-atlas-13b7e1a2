@@ -1,0 +1,434 @@
+---
+title: Installation
+description: Detailed guide for installing UNC from source
+---
+
+# Installation
+
+This guide walks you through installing UNC (Universal Neural Compiler) from source, including all prerequisites and troubleshooting common issues.
+
+## System Requirements
+
+### Operating System
+
+- **macOS** (10.15 Catalina or later)
+- **Apple Silicon** (M1/M2/M3/M4) recommended for best performance
+- Intel Macs are supported but will have significantly lower inference speeds
+
+<Note>
+UNC currently targets Metal for GPU acceleration, which is macOS-only. Support for CUDA (Linux/Windows) and ROCm (Linux) is planned.
+</Note>
+
+### Hardware Recommendations
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| CPU | Apple M1 or Intel Core i5 | Apple M2 Pro or later |
+| RAM | 8 GB | 16 GB or more |
+| Storage | 5 GB free | 20 GB+ for multiple models |
+| GPU | Integrated (M1+) | M1 Pro/Max/Ultra with 16+ GPU cores |
+
+<Warning>
+Models like LLaMA-3-8B require significant memory. Ensure you have at least 16 GB RAM and adequate GPU memory for larger models.
+</Warning>
+
+## Installing Prerequisites
+
+<Steps>
+  <Step title="Install Xcode Command Line Tools">
+    UNC requires clang and Metal compiler tools, which are part of Xcode Command Line Tools.
+    
+    ```bash
+    xcode-select --install
+    ```
+    
+    This will open a dialog prompting you to install the tools. Click "Install" and wait for completion.
+    
+    ### Verify Installation
+    
+    ```bash
+    clang --version
+    ```
+    
+    Expected output:
+    
+    ```
+    Apple clang version 15.0.0 (clang-1500.3.9.4)
+    Target: arm64-apple-darwin23.0.0
+    Thread model: posix
+    ```
+    
+    <Tip>
+    If you already have Xcode installed, Command Line Tools are included. Run `xcode-select -p` to verify the path.
+    </Tip>
+  </Step>
+
+  <Step title="Install Rust Toolchain">
+    UNC is written in Rust and requires `rustc` 1.70 or later.
+    
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+    
+    Follow the on-screen prompts. The default options are recommended:
+    
+    ```
+    1) Proceed with installation (default)
+    ```
+    
+    ### Reload Your Shell
+    
+    After installation completes, reload your shell configuration:
+    
+    ```bash
+    source $HOME/.cargo/env
+    ```
+    
+    Or restart your terminal.
+    
+    ### Verify Installation
+    
+    ```bash
+    rustc --version
+    cargo --version
+    ```
+    
+    Expected output:
+    
+    ```
+    rustc 1.75.0 (82e1608df 2023-12-21)
+    cargo 1.75.0 (1d8b05cdd 2023-11-20)
+    ```
+    
+    <Note>
+    The exact version numbers may differ. Any version 1.70+ is compatible.
+    </Note>
+  </Step>
+</Steps>
+
+## Building UNC from Source
+
+<Steps>
+  <Step title="Clone the Repository">
+    Clone the UNC repository from GitHub:
+    
+    ```bash
+    git clone <repo-url>
+    cd unc
+    ```
+    
+    Replace `<repo-url>` with the actual repository URL.
+  </Step>
+
+  <Step title="Build in Release Mode">
+    Compile UNC with optimizations enabled:
+    
+    ```bash
+    cargo build --release
+    ```
+    
+    This process typically takes 5-10 minutes on first build as Cargo downloads and compiles all dependencies.
+    
+    You'll see output like:
+    
+    ```
+    Compiling unc v0.1.0 (/path/to/unc)
+    Finished release [optimized] target(s) in 7m 23s
+    ```
+    
+    The compiled binary will be located at:
+    
+    ```
+    ./target/release/unc
+    ```
+    
+    <Warning>
+    Always use `--release` for production builds. Debug builds (`cargo build`) are 10-100x slower.
+    </Warning>
+  </Step>
+
+  <Step title="Add to PATH (Optional)">
+    For system-wide access, add the binary to your PATH.
+    
+    **Option 1: Symlink to /usr/local/bin**
+    
+    ```bash
+    sudo ln -s $(pwd)/target/release/unc /usr/local/bin/unc
+    ```
+    
+    **Option 2: Copy to /usr/local/bin**
+    
+    ```bash
+    sudo cp target/release/unc /usr/local/bin/
+    ```
+    
+    **Option 3: Add to PATH in shell config**
+    
+    Add to `~/.zshrc` or `~/.bashrc`:
+    
+    ```bash
+    export PATH="$PATH:/path/to/unc/target/release"
+    ```
+    
+    Then reload:
+    
+    ```bash
+    source ~/.zshrc  # or ~/.bashrc
+    ```
+  </Step>
+</Steps>
+
+## Verifying Installation
+
+Test that UNC is correctly installed:
+
+```bash
+unc --version
+```
+
+Expected output:
+
+```
+unc 0.1.0
+```
+
+### List Supported Architectures
+
+```bash
+unc list-architectures
+```
+
+You should see:
+
+```
+Supported architectures:
+  LlamaForCausalLM               LLaMA, LLaMA-2, LLaMA-3
+  MistralForCausalLM             Mistral, Mixtral
+  Qwen2ForCausalLM               Qwen, Qwen-2
+  PhiForCausalLM                 Phi-2, Phi-3
+  GemmaForCausalLM               Gemma, Gemma-2
+```
+
+<Tip>
+Run `unc --help` to see all available commands and options.
+</Tip>
+
+## Environment Variables
+
+### HF_TOKEN (Required for Private Models)
+
+To download private or gated models from HuggingFace (e.g., LLaMA-3), you need an access token:
+
+1. Go to [HuggingFace Settings > Access Tokens](https://huggingface.co/settings/tokens)
+2. Create a new token with "Read" permissions
+3. Set the token in your environment:
+
+```bash
+export HF_TOKEN=hf_your_token_here
+```
+
+Or pass it directly to the compile command:
+
+```bash
+unc compile --model meta-llama/Llama-3-8B --hf-token hf_your_token_here ...
+```
+
+<Note>
+Public models like TinyLlama, Qwen, and Phi don't require authentication.
+</Note>
+
+### UNC_METALLIB_PATH (Optional)
+
+Override the path to the compiled Metal library:
+
+```bash
+export UNC_METALLIB_PATH=/path/to/custom.metallib
+```
+
+By default, UNC looks for `<model_name>.metallib` next to the `.unc` file.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Error: 'clang: command not found'">
+    **Cause**: Xcode Command Line Tools are not installed.
+    
+    **Solution**: Install them:
+    
+    ```bash
+    xcode-select --install
+    ```
+    
+    If already installed, verify the active developer directory:
+    
+    ```bash
+    xcode-select -p
+    ```
+    
+    It should output `/Library/Developer/CommandLineTools` or `/Applications/Xcode.app/Contents/Developer`.
+  </Accordion>
+
+  <Accordion title="Error: 'rustc: command not found'">
+    **Cause**: Rust toolchain is not installed or not in PATH.
+    
+    **Solution**: Install Rust:
+    
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+    
+    Then reload your shell:
+    
+    ```bash
+    source $HOME/.cargo/env
+    ```
+  </Accordion>
+
+  <Accordion title="Cargo build fails with 'linker error'">
+    **Cause**: Missing Metal framework or incompatible SDK.
+    
+    **Solution**: Ensure Xcode Command Line Tools are installed and up to date:
+    
+    ```bash
+    softwareupdate --list
+    softwareupdate --install -a
+    ```
+    
+    If using Xcode (not just Command Line Tools), ensure it's the active version:
+    
+    ```bash
+    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    ```
+  </Accordion>
+
+  <Accordion title="HuggingFace download fails with 401 Unauthorized">
+    **Cause**: Model is private or gated, and no HF_TOKEN is set.
+    
+    **Solution**: Set your HuggingFace token:
+    
+    ```bash
+    export HF_TOKEN=hf_...
+    ```
+    
+    For gated models (like LLaMA-3), you must also:
+    
+    1. Go to the model page on HuggingFace
+    2. Accept the license agreement
+    3. Wait for approval (usually instant)
+  </Accordion>
+
+  <Accordion title="Compilation succeeds but 'unc run' crashes">
+    **Cause**: Corrupted JIT cache or missing Metal library.
+    
+    **Solution**: Clear the JIT cache:
+    
+    ```bash
+    rm -rf ~/Library/Caches/unc/jit
+    ```
+    
+    Ensure the `.metallib` file exists next to your `.unc` file:
+    
+    ```bash
+    ls -la ./tinyllama.*
+    ```
+    
+    You should see:
+    
+    ```
+    tinyllama.unc
+    tinyllama.metallib
+    ```
+  </Accordion>
+
+  <Accordion title="Out of memory errors during compilation">
+    **Cause**: Insufficient RAM for large models.
+    
+    **Solution**: 
+    
+    1. Close other applications to free memory
+    2. Use a smaller model (e.g., TinyLlama-1.1B instead of LLaMA-3-8B)
+    3. Use aggressive quantization (`--quant q4-0`)
+    4. Reduce `--max-seq-len` (default: 4096)
+    
+    ```bash
+    unc compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+      --quant q4-0 \
+      --max-seq-len 2048 \
+      -o ./model
+    ```
+  </Accordion>
+
+  <Accordion title="Slow inference performance">
+    **Possible causes**:
+    
+    - Debug build: Ensure you used `cargo build --release`
+    - Low quantization: Try `--quant q4-0` for maximum speed
+    - Thermal throttling: Check Activity Monitor for CPU/GPU temperature
+    - Intel Mac: Performance is significantly lower than Apple Silicon
+    
+    **Benchmark your system**:
+    
+    ```bash
+    unc run ./model.unc --prompt "Test" --max-tokens 100
+    ```
+    
+    Compare the reported `tok/s` to expected values:
+    
+    | Model | Quant | Apple M1 Pro | Apple M2 Max |
+    |-------|-------|--------------|---------------|
+    | TinyLlama-1.1B | Q4_0 | 152 tok/s | ~200 tok/s |
+    | Qwen3-4B | Q4_0 | 39 tok/s | ~55 tok/s |
+  </Accordion>
+</AccordionGroup>
+
+## Updating UNC
+
+To update to the latest version:
+
+```bash
+cd /path/to/unc
+git pull origin main
+cargo build --release
+```
+
+<Warning>
+Recompile your models after updating UNC, as the `.unc` bundle format may change between versions.
+</Warning>
+
+## Uninstalling
+
+To remove UNC:
+
+```bash
+# Remove binary
+sudo rm /usr/local/bin/unc
+
+# Remove JIT cache
+rm -rf ~/Library/Caches/unc
+
+# Remove HuggingFace model cache (optional)
+rm -rf ~/Library/Caches/huggingface
+
+# Remove source directory
+rm -rf /path/to/unc
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Compile your first model in minutes
+  </Card>
+  
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Learn about UNC's internals and architecture
+  </Card>
+  
+  <Card title="CLI Reference" icon="terminal" href="/cli/compile">
+    Explore all CLI commands and options
+  </Card>
+  
+  <Card title="Contributing" icon="github" href="https://github.com/pacifio/unc">
+    Help improve UNC
+  </Card>
+</CardGroup>
